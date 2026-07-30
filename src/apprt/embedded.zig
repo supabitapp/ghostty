@@ -460,6 +460,9 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        command_wrapper: ?[*]const [*:0]const u8 = null,
+        command_wrapper_count: usize = 0,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -531,6 +534,17 @@ pub const Surface = struct {
             if (cmd.len > 0) {
                 config.command = .{ .shell = cmd };
                 config.@"wait-after-command" = true;
+            }
+        }
+
+        if (opts.command_wrapper) |c_wrapper| {
+            if (opts.command_wrapper_count > 0) {
+                const alloc = config.arenaAlloc();
+                const argv = try alloc.alloc([:0]const u8, opts.command_wrapper_count);
+                for (c_wrapper[0..opts.command_wrapper_count], 0..) |arg, i| {
+                    argv[i] = try alloc.dupeZ(u8, std.mem.sliceTo(arg, 0));
+                }
+                config.@"command-wrapper" = .{ .direct = argv };
             }
         }
 

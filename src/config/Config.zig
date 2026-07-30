@@ -1195,6 +1195,8 @@ command: ?Command = null,
 ///     manually.
 @"initial-command": ?Command = null,
 
+@"command-wrapper": ?Command = null,
+
 /// Controls when command finished notifications are sent. There are
 /// three options:
 ///
