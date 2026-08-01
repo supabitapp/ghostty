@@ -463,7 +463,49 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        command_wrapper: ?[*]const [*:0]const u8 = null,
+        command_wrapper_count: usize = 0,
     };
+
+    fn applyCommandWrapper(config: *Config, opts: Options) !void {
+        const command_wrapper = opts.command_wrapper orelse return;
+        if (opts.command_wrapper_count == 0) return;
+
+        const alloc = config.arenaAlloc();
+        const args = try alloc.alloc([:0]const u8, opts.command_wrapper_count);
+        for (command_wrapper[0..opts.command_wrapper_count], 0..) |arg, i| {
+            args[i] = try alloc.dupeZ(u8, std.mem.sliceTo(arg, 0));
+        }
+        config.@"command-wrapper" = .{ .direct = args };
+    }
+
+    test "Surface.Options command wrapper reaches Exec.Config" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+
+        const command_wrapper = [_][*:0]const u8{
+            "/Applications/Supaterm.app/Contents/Resources/bin/zmx",
+            "attach",
+            "spt-session",
+        };
+        try applyCommandWrapper(&config, .{
+            .command_wrapper = &command_wrapper,
+            .command_wrapper_count = command_wrapper.len,
+        });
+
+        const exec_wrapper: @FieldType(
+            @import("../termio/Exec.zig").Config,
+            "command_wrapper",
+        ) = config.@"command-wrapper";
+        const args = exec_wrapper.?.direct;
+
+        try testing.expectEqual(command_wrapper.len, args.len);
+        for (command_wrapper, args) |expected, actual| {
+            try testing.expectEqualStrings(std.mem.sliceTo(expected, 0), actual);
+        }
+    }
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
         self.* = .{
@@ -536,6 +578,8 @@ pub const Surface = struct {
                 config.@"wait-after-command" = true;
             }
         }
+
+        try applyCommandWrapper(&config, opts);
 
         // Apply any environment variables that were requested.
         if (opts.env_var_count > 0) {
