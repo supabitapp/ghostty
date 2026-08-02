@@ -340,12 +340,13 @@ fn sshCommandArgs(
     forward_env: bool,
     supaterm_cli: ?[]const u8,
 ) ![]const []const u8 {
-    if (forward_env) if (supaterm_cli) |cli| if (cli.len > 0) {
+    const cli = if (forward_env) supaterm_cli orelse "" else "";
+    if (cli.len > 0) {
         return std.mem.concat(alloc, []const u8, &.{
             &.{ cli, "ssh", "--term", term, "--ssh", ssh, "--" },
             ssh_args,
         });
-    };
+    }
 
     const env_opts: []const []const u8 = if (forward_env) env_opts: {
         const set_term = try std.fmt.allocPrint(
