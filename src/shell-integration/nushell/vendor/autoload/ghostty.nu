@@ -8,14 +8,17 @@ export module ghostty {
   export def --wrapped ssh [...args] {
     mut ssh_env = {}
     mut ssh_opts = []
+    let supaterm_cli = $env.SUPATERM_CLI_PATH? | default ""
 
     # `ssh-env`: use xterm-256color and propagate COLORTERM/TERM_PROGRAM vars
     if (has_feature "ssh-env") {
       $ssh_env.TERM = "xterm-256color"
-      $ssh_opts = [
-        "-o" "SetEnv COLORTERM=truecolor"
-        "-o" "SendEnv TERM_PROGRAM TERM_PROGRAM_VERSION"
-      ]
+      if ($supaterm_cli | is-empty) {
+        $ssh_opts = [
+          "-o" "SetEnv COLORTERM=truecolor"
+          "-o" "SendEnv TERM_PROGRAM TERM_PROGRAM_VERSION"
+        ]
+      }
     }
 
     # `ssh-terminfo`: auto-install xterm-ghostty terminfo on remote hosts
@@ -74,8 +77,12 @@ export module ghostty {
     }
 
     let ssh_args = $ssh_opts ++ $args
-    with-env $ssh_env {
-      ^ssh ...$ssh_args
+    if (has_feature "ssh-env") and ($supaterm_cli | is-not-empty) {
+      ^$supaterm_cli ssh --term $ssh_env.TERM -- ...$ssh_args
+    } else {
+      with-env $ssh_env {
+        ^ssh ...$ssh_args
+      }
     }
   }
 

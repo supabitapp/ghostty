@@ -79,9 +79,13 @@
   fn ssh-integration {|@args|
     var ssh-term = "xterm-256color"
     var ssh-opts = []
+    var supaterm-cli = ""
+    if (has-env SUPATERM_CLI_PATH) {
+      set supaterm-cli = $E:SUPATERM_CLI_PATH
+    }
 
     # Configure environment variables for remote session
-    if (has-value $features ssh-env) {
+    if (and (has-value $features ssh-env) (eq $supaterm-cli "")) {
       set ssh-opts = (conj $ssh-opts ^
         -o "SetEnv COLORTERM=truecolor" ^
         -o "SendEnv TERM_PROGRAM TERM_PROGRAM_VERSION")
@@ -148,8 +152,12 @@
       }
     }
 
-    with [E:TERM = $ssh-term] {
-      (external ssh) $@ssh-opts $@args
+    if (and (has-value $features ssh-env) (not-eq $supaterm-cli "")) {
+      $supaterm-cli ssh --term $ssh-term -- $@ssh-opts $@args
+    } else {
+      with [E:TERM = $ssh-term] {
+        (external ssh) $@ssh-opts $@args
+      }
     }
   }
 

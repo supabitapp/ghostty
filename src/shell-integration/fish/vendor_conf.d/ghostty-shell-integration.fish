@@ -126,9 +126,11 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
             set -l features (string split ',' -- "$GHOSTTY_SHELL_FEATURES")
             set -l ssh_term xterm-256color
             set -l ssh_opts
+            set -l supaterm_cli
+            set -q SUPATERM_CLI_PATH; and set supaterm_cli "$SUPATERM_CLI_PATH"
 
             # Configure environment variables for remote session
-            if contains ssh-env $features
+            if contains ssh-env $features; and test -z "$supaterm_cli"
                 set -a ssh_opts -o "SetEnv COLORTERM=truecolor"
                 set -a ssh_opts -o "SendEnv TERM_PROGRAM TERM_PROGRAM_VERSION"
             end
@@ -198,7 +200,11 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
             end
 
             # Execute SSH with TERM environment variable
-            TERM="$ssh_term" command ssh $ssh_opts $argv
+            if contains ssh-env $features; and test -n "$supaterm_cli"
+                "$supaterm_cli" ssh --term "$ssh_term" -- $ssh_opts $argv
+            else
+                TERM="$ssh_term" command ssh $ssh_opts $argv
+            end
         end
     end
 
