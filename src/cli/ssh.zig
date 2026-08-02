@@ -284,25 +284,18 @@ fn runInner(
         };
     };
 
-    // Build the full argv: [ssh, ...our opts, ...user args]
-    const env_opts: []const []const u8 = if (opts.@"forward-env") env_opts: {
-        const set_term = try std.fmt.allocPrint(
-            alloc,
-            "SetEnv=TERM={s}",
-            .{session.term},
-        );
-        break :env_opts &.{
-            "-o", set_term,
-            "-o", "SendEnv=COLORTERM",
-            "-o", "SendEnv=TERM_PROGRAM",
-            "-o", "SendEnv=TERM_PROGRAM_VERSION",
-        };
-    } else &.{};
-    const argv = try std.mem.concat(alloc, []const u8, &.{
-        &.{opts.ssh},
-        env_opts,
+    const supaterm_cli = if (opts.@"forward-env")
+        global.environ().getAlloc(alloc, "SUPATERM_CLI_PATH") catch null
+    else
+        null;
+    const argv = try sshCommandArgs(
+        alloc,
+        opts.ssh,
         opts._ssh_args.items,
-    });
+        session.term,
+        opts.@"forward-env",
+        supaterm_cli,
+    );
     verbosePrint(opts, stderr, "exec: {f}", .{Joined{ .items = argv }});
 
     const exit_code = childExec(argv) catch |err| {
@@ -337,6 +330,41 @@ fn runInner(
     };
 
     return exit_code;
+}
+
+fn sshCommandArgs(
+    alloc: Allocator,
+    ssh: []const u8,
+    ssh_args: []const []const u8,
+    term: []const u8,
+    forward_env: bool,
+    supaterm_cli: ?[]const u8,
+) ![]const []const u8 {
+    if (forward_env) if (supaterm_cli) |cli| if (cli.len > 0) {
+        return std.mem.concat(alloc, []const u8, &.{
+            &.{ cli, "ssh", "--term", term, "--ssh", ssh, "--" },
+            ssh_args,
+        });
+    };
+
+    const env_opts: []const []const u8 = if (forward_env) env_opts: {
+        const set_term = try std.fmt.allocPrint(
+            alloc,
+            "SetEnv=TERM={s}",
+            .{term},
+        );
+        break :env_opts &.{
+            "-o", set_term,
+            "-o", "SendEnv=COLORTERM",
+            "-o", "SendEnv=TERM_PROGRAM",
+            "-o", "SendEnv=TERM_PROGRAM_VERSION",
+        };
+    } else &.{};
+    return std.mem.concat(alloc, []const u8, &.{
+        &.{ssh},
+        env_opts,
+        ssh_args,
+    });
 }
 
 /// Log to `.ssh` and, if `--verbose`, also print to stderr.
@@ -600,6 +628,76 @@ test "parseManuallyHook: explicit -- separator" {
     try testing.expectEqual(@as(usize, 2), opts._ssh_args.items.len);
     try testing.expectEqualStrings("--some-rare-ssh-arg", opts._ssh_args.items[0]);
     try testing.expectEqualStrings("user@example.com", opts._ssh_args.items[1]);
+}
+
+test "sshCommandArgs routes environment forwarding through Supaterm" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const argv = try sshCommandArgs(
+        arena.allocator(),
+        "/usr/bin/ssh",
+        &.{ "-p", "2222", "example.com" },
+        "xterm-ghostty",
+        true,
+        "/Applications/Supaterm.app/Contents/MacOS/sp",
+    );
+    const expected: []const []const u8 = &.{
+        "/Applications/Supaterm.app/Contents/MacOS/sp",
+        "ssh",
+        "--term",
+        "xterm-ghostty",
+        "--ssh",
+        "/usr/bin/ssh",
+        "--",
+        "-p",
+        "2222",
+        "example.com",
+    };
+    try testing.expectEqualDeep(expected, argv);
+}
+
+test "sshCommandArgs preserves native forwarding without Supaterm" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const argv = try sshCommandArgs(
+        arena.allocator(),
+        "ssh",
+        &.{"example.com"},
+        "xterm-ghostty",
+        true,
+        null,
+    );
+    const expected: []const []const u8 = &.{
+        "ssh",
+        "-o",
+        "SetEnv=TERM=xterm-ghostty",
+        "-o",
+        "SendEnv=COLORTERM",
+        "-o",
+        "SendEnv=TERM_PROGRAM",
+        "-o",
+        "SendEnv=TERM_PROGRAM_VERSION",
+        "example.com",
+    };
+    try testing.expectEqualDeep(expected, argv);
+}
+
+test "sshCommandArgs disables all forwarding" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const argv = try sshCommandArgs(
+        arena.allocator(),
+        "ssh",
+        &.{"example.com"},
+        "xterm-ghostty",
+        false,
+        "/Applications/Supaterm.app/Contents/MacOS/sp",
+    );
+    const expected: []const []const u8 = &.{ "ssh", "example.com" };
+    try testing.expectEqualDeep(expected, argv);
 }
 
 test "parseDestination: typical ssh -G output" {
