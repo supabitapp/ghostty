@@ -2084,13 +2084,13 @@ test "wrappedCommandArgs prepends wrapper arguments" {
 
     const base_args: []const [:0]const u8 = &.{ "/bin/zsh", "-l" };
     const result = try wrappedCommandArgs(alloc, base_args, .{ .direct = &.{
-        "/Applications/Supaterm.app/Contents/Resources/bin/zmx",
+        "/Applications/Supaterm.app/Contents/Helpers/zmx",
         "attach",
         "spt-session",
     } });
 
     try testing.expectEqual(5, result.len);
-    try testing.expectEqualStrings("/Applications/Supaterm.app/Contents/Resources/bin/zmx", result[0]);
+    try testing.expectEqualStrings("/Applications/Supaterm.app/Contents/Helpers/zmx", result[0]);
     try testing.expectEqualStrings("attach", result[1]);
     try testing.expectEqualStrings("spt-session", result[2]);
     try testing.expectEqualStrings("/bin/zsh", result[3]);
