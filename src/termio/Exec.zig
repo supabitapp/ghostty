@@ -560,6 +560,7 @@ pub const ThreadData = struct {
 
 pub const Config = struct {
     command: ?configpkg.Command = null,
+    command_wrapper: ?configpkg.Command = null,
     env: EnvMap,
     env_override: configpkg.RepeatableStringMap = .{},
     shell_integration: configpkg.Config.ShellIntegration = .detect,
@@ -819,7 +820,7 @@ const Subprocess = struct {
         }
 
         // Build our args list
-        const args: []const [:0]const u8 = execCommand(
+        const base_args: []const [:0]const u8 = execCommand(
             alloc,
             shell_command,
             internal_os.passwd,
@@ -843,6 +844,7 @@ const Subprocess = struct {
             // This logs on its own, this is a bad error.
             error.SystemError => return err,
         };
+        const args = try wrappedCommandArgs(alloc, base_args, cfg.command_wrapper);
 
         // We have to copy the cwd because there is no guarantee that
         // pointers in full_config remain valid.
@@ -2054,6 +2056,45 @@ fn appendEnvAlways(
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Exec, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.subprocess.getProcessInfo(info);
+}
+
+fn wrappedCommandArgs(
+    alloc: Allocator,
+    base_args: []const [:0]const u8,
+    wrapper: ?configpkg.Command,
+) Allocator.Error![]const [:0]const u8 {
+    const command = wrapper orelse return base_args;
+    var args: std.ArrayList([:0]const u8) = .empty;
+    defer args.deinit(alloc);
+
+    var iterator = try command.argIterator(alloc);
+    defer iterator.deinit();
+    while (iterator.next()) |arg| {
+        try args.append(alloc, try alloc.dupeZ(u8, arg));
+    }
+    try args.appendSlice(alloc, base_args);
+    return try args.toOwnedSlice(alloc);
+}
+
+test "wrappedCommandArgs prepends wrapper arguments" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const base_args: []const [:0]const u8 = &.{ "/bin/zsh", "-l" };
+    const result = try wrappedCommandArgs(alloc, base_args, .{ .direct = &.{
+        "/Applications/Supaterm.app/Contents/Resources/bin/zmx",
+        "attach",
+        "spt-session",
+    } });
+
+    try testing.expectEqual(5, result.len);
+    try testing.expectEqualStrings("/Applications/Supaterm.app/Contents/Resources/bin/zmx", result[0]);
+    try testing.expectEqualStrings("attach", result[1]);
+    try testing.expectEqualStrings("spt-session", result[2]);
+    try testing.expectEqualStrings("/bin/zsh", result[3]);
+    try testing.expectEqualStrings("-l", result[4]);
 }
 
 test "execCommand darwin: shell command" {
