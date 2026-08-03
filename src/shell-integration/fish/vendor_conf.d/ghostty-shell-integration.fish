@@ -125,8 +125,8 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
     if contains ssh-env $features; or contains ssh-terminfo $features
         function ssh --wraps=ssh --description "SSH wrapper with Ghostty integration"
             set -l features (string split ',' -- "$GHOSTTY_SHELL_FEATURES")
-            if contains ssh-env $features; and set -q SUPATERM_CLI_PATH; and test -n "$SUPATERM_CLI_PATH"
-                "$SUPATERM_CLI_PATH" ssh --term xterm-256color --ssh ssh -- $argv
+            if set -q SUPATERM_CLI_PATH; and test -n "$SUPATERM_CLI_PATH"
+                "$SUPATERM_CLI_PATH" ssh -- $argv
             else
                 set -l flags
                 contains ssh-env $features; or set -a flags --forward-env=false

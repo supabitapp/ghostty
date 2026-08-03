@@ -118,8 +118,8 @@ fi
 #
 if [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-* ]]; then
   function ssh() {
-    if [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-env* && -n "${SUPATERM_CLI_PATH:-}" ]]; then
-      "$SUPATERM_CLI_PATH" ssh --term xterm-256color --ssh ssh -- "$@"
+    if [[ -n "${SUPATERM_CLI_PATH:-}" ]]; then
+      "$SUPATERM_CLI_PATH" ssh -- "$@"
     else
       builtin local -a flags
       flags=()

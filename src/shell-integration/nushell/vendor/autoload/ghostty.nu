@@ -12,8 +12,8 @@ export module ghostty {
     }
 
     let supaterm_cli = $env.SUPATERM_CLI_PATH? | default ""
-    if (has_feature "ssh-env") and ($supaterm_cli | is-not-empty) {
-      ^$supaterm_cli "ssh" "--term" "xterm-256color" "--ssh" "ssh" "--" ...$args
+    if $supaterm_cli | is-not-empty {
+      ^$supaterm_cli "ssh" "--" ...$args
     } else {
       let ghostty = ($env.GHOSTTY_BIN_DIR? | default "") | path join "ghostty"
       mut flags = []

@@ -79,8 +79,8 @@
   # SSH Integration
   #
   fn ssh-integration {|@args|
-    if (and (has-value $features ssh-env) (has-env SUPATERM_CLI_PATH) (not-eq $E:SUPATERM_CLI_PATH "")) {
-      $E:SUPATERM_CLI_PATH ssh --term xterm-256color --ssh ssh -- $@args
+    if (and (has-env SUPATERM_CLI_PATH) (not-eq $E:SUPATERM_CLI_PATH "")) {
+      $E:SUPATERM_CLI_PATH ssh -- $@args
     } else {
       var ghostty = $E:GHOSTTY_BIN_DIR/"ghostty"
       var flags = []
