@@ -78,18 +78,23 @@
 
   # SSH Integration
   #
-  # Wrap `ssh` with `ghostty +ssh` and translate the shell-integration
-  # feature flags into command options.
   fn ssh-integration {|@args|
-    var ghostty = $E:GHOSTTY_BIN_DIR/"ghostty"
-    var flags = []
-    if (not (has-value $features ssh-env)) {
-      set flags = (conj $flags --forward-env=false)
+    var ghostty = /ghostty
+    if (and (has-env GHOSTTY_BIN_DIR) (not-eq $E:GHOSTTY_BIN_DIR "")) {
+      set ghostty = $E:GHOSTTY_BIN_DIR/"ghostty"
     }
-    if (not (has-value $features ssh-terminfo)) {
-      set flags = (conj $flags --terminfo=false)
+    if (and (not (has-external $ghostty)) (has-env SUPATERM_CLI_PATH) (not-eq $E:SUPATERM_CLI_PATH "")) {
+      $E:SUPATERM_CLI_PATH ssh -- $@args
+    } else {
+      var flags = []
+      if (not (has-value $features ssh-env)) {
+        set flags = (conj $flags --forward-env=false)
+      }
+      if (not (has-value $features ssh-terminfo)) {
+        set flags = (conj $flags --terminfo=false)
+      }
+      $ghostty +ssh $@flags -- $@args
     }
-    $ghostty +ssh $@flags -- $@args
   }
 
   defer {

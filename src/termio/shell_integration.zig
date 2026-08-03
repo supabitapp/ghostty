@@ -1007,6 +1007,76 @@ test "zsh: missing resources" {
     try testing.expectEqual(0, env.count());
 }
 
+test "shell integration resources route every Supaterm SSH feature without Ghostty executable" {
+    const testing = std.testing;
+    const Case = struct {
+        source: []const u8,
+        activation: []const u8,
+        supaterm_condition: []const u8,
+        supaterm_command: []const u8,
+        native_command: []const u8,
+    };
+    const sh_activation = "[[ \"$GHOSTTY_SHELL_FEATURES\" == *ssh-* ]]";
+    const sh_condition = "[[ -n \"${SUPATERM_CLI_PATH:-}\" && ( -z \"${GHOSTTY_BIN_DIR:-}\" || ! -x \"$GHOSTTY_BIN_DIR/ghostty\" ) ]]";
+    const sh_command = "\"$SUPATERM_CLI_PATH\" ssh -- \"$@\"";
+    const cases = [_]Case{
+        .{
+            .source = @embedFile("../shell-integration/bash/ghostty.bash"),
+            .activation = sh_activation,
+            .supaterm_condition = sh_condition,
+            .supaterm_command = sh_command,
+            .native_command = "\"$GHOSTTY_BIN_DIR/ghostty\" +ssh \"${flags[@]}\" -- \"$@\"",
+        },
+        .{
+            .source = @embedFile("../shell-integration/zsh/ghostty-integration"),
+            .activation = sh_activation,
+            .supaterm_condition = sh_condition,
+            .supaterm_command = sh_command,
+            .native_command = "\"$GHOSTTY_BIN_DIR/ghostty\" +ssh $flags -- \"$@\"",
+        },
+        .{
+            .source = @embedFile("../shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish"),
+            .activation = "contains ssh-env $features; or contains ssh-terminfo $features",
+            .supaterm_condition = "not test -x \"$ghostty\"; and set -q SUPATERM_CLI_PATH; and test -n \"$SUPATERM_CLI_PATH\"",
+            .supaterm_command = "\"$SUPATERM_CLI_PATH\" ssh -- $argv",
+            .native_command = "\"$ghostty\" +ssh $flags -- $argv",
+        },
+        .{
+            .source = @embedFile("../shell-integration/elvish/lib/ghostty-integration.elv"),
+            .activation = "(and (str:contains $E:GHOSTTY_SHELL_FEATURES ssh-) (has-external ssh))",
+            .supaterm_condition = "(and (not (has-external $ghostty)) (has-env SUPATERM_CLI_PATH) (not-eq $E:SUPATERM_CLI_PATH \"\"))",
+            .supaterm_command = "$E:SUPATERM_CLI_PATH ssh -- $@args",
+            .native_command = "$ghostty +ssh $@flags -- $@args",
+        },
+        .{
+            .source = @embedFile("../shell-integration/nushell/vendor/autoload/ghostty.nu"),
+            .activation = "if not ((has_feature \"ssh-env\") or (has_feature \"ssh-terminfo\"))",
+            .supaterm_condition = "if (($supaterm_cli | is-not-empty) and (not $ghostty_executable))",
+            .supaterm_command = "^$supaterm_cli \"ssh\" \"--\" ...$args",
+            .native_command = "^$ghostty \"+ssh\" ...$flags \"--\" ...$args",
+        },
+    };
+
+    for (cases) |case| {
+        try testing.expect(std.mem.indexOf(u8, case.source, case.activation) != null);
+        const condition_start = std.mem.indexOf(u8, case.source, case.supaterm_condition).?;
+        const native_start = std.mem.indexOfPos(u8, case.source, condition_start, "else").?;
+        const supaterm_branch = case.source[condition_start..native_start];
+        try testing.expect(std.mem.indexOf(u8, supaterm_branch, case.supaterm_command) != null);
+        try testing.expect(std.mem.indexOf(u8, supaterm_branch, "+ssh") == null);
+        try testing.expect(std.mem.indexOfPos(u8, case.source, native_start, case.native_command) != null);
+    }
+}
+
+test "Nushell native SSH route resolves Ghostty from PATH" {
+    const source = @embedFile("../shell-integration/nushell/vendor/autoload/ghostty.nu");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "let ghostty = ($env.GHOSTTY_BIN_DIR? | default \"\") | path join \"ghostty\"",
+    ) != null);
+}
+
 /// Test helper that creates a temporary resources directory with shell integration paths.
 const TmpResourcesDir = struct {
     tmp_dir: std.testing.TmpDir,
