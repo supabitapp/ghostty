@@ -1679,6 +1679,26 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
+    export fn ghostty_surface_read_text_tail(
+        surface: *Surface,
+        lines: u32,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+
+        const screen = surface.core_surface.renderer_state.terminal.screens.active;
+        const text = screen.lastLinesString(
+            global.alloc(),
+            @intCast(lines),
+        ) catch |err| {
+            log.warn("error reading text tail err={}", .{err});
+            return false;
+        };
+        takeTextResult(result, .{ .text = text });
+        return true;
+    }
+
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
@@ -1695,7 +1715,12 @@ pub const CAPI = struct {
             return false;
         };
 
-        const vp: CoreSurface.Text.Viewport = text.viewport orelse .{
+        takeTextResult(result, text);
+        return true;
+    }
+
+    fn takeTextResult(result: *Text, text: CoreSurface.Text) void {
+        const viewport: CoreSurface.Text.Viewport = text.viewport orelse .{
             .tl_px_x = -1,
             .tl_px_y = -1,
             .offset_start = 0,
@@ -1703,15 +1728,13 @@ pub const CAPI = struct {
         };
 
         result.* = .{
-            .tl_px_x = vp.tl_px_x,
-            .tl_px_y = vp.tl_px_y,
-            .offset_start = vp.offset_start,
-            .offset_len = vp.offset_len,
+            .tl_px_x = viewport.tl_px_x,
+            .tl_px_y = viewport.tl_px_y,
+            .offset_start = viewport.offset_start,
+            .offset_len = viewport.offset_len,
             .text = text.text.ptr,
             .text_len = text.text.len,
         };
-
-        return true;
     }
 
     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
