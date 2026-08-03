@@ -1068,6 +1068,15 @@ test "shell integration resources route every Supaterm SSH feature without Ghost
     }
 }
 
+test "Nushell native SSH route resolves Ghostty from PATH" {
+    const source = @embedFile("../shell-integration/nushell/vendor/autoload/ghostty.nu");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "let ghostty = ($env.GHOSTTY_BIN_DIR? | default \"\") | path join \"ghostty\"",
+    ) != null);
+}
+
 /// Test helper that creates a temporary resources directory with shell integration paths.
 const TmpResourcesDir = struct {
     tmp_dir: std.testing.TmpDir,
