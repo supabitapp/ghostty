@@ -118,7 +118,7 @@ fi
 #
 if [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-* ]]; then
   function ssh() {
-    if [[ -n "${SUPATERM_CLI_PATH:-}" ]]; then
+    if [[ -n "${SUPATERM_CLI_PATH:-}" && ( -z "${GHOSTTY_BIN_DIR:-}" || ! -x "$GHOSTTY_BIN_DIR/ghostty" ) ]]; then
       "$SUPATERM_CLI_PATH" ssh -- "$@"
     else
       builtin local -a flags

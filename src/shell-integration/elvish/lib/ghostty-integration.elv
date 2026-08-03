@@ -79,10 +79,13 @@
   # SSH Integration
   #
   fn ssh-integration {|@args|
-    if (and (has-env SUPATERM_CLI_PATH) (not-eq $E:SUPATERM_CLI_PATH "")) {
+    var ghostty = /ghostty
+    if (and (has-env GHOSTTY_BIN_DIR) (not-eq $E:GHOSTTY_BIN_DIR "")) {
+      set ghostty = $E:GHOSTTY_BIN_DIR/"ghostty"
+    }
+    if (and (not (has-external $ghostty)) (has-env SUPATERM_CLI_PATH) (not-eq $E:SUPATERM_CLI_PATH "")) {
       $E:SUPATERM_CLI_PATH ssh -- $@args
     } else {
-      var ghostty = $E:GHOSTTY_BIN_DIR/"ghostty"
       var flags = []
       if (not (has-value $features ssh-env)) {
         set flags = (conj $flags --forward-env=false)
