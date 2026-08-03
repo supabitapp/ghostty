@@ -17,6 +17,7 @@ const PageList = @import("PageList.zig");
 const selection_codepoints = @import("selection_codepoints.zig");
 const StringMap = @import("StringMap.zig");
 const ScreenFormatter = @import("formatter.zig").ScreenFormatter;
+const PageListFormatter = @import("formatter.zig").PageListFormatter;
 const PinMap = @import("formatter.zig").PinMap;
 const osc = @import("osc.zig");
 const pagepkg = @import("page.zig");
@@ -3606,6 +3607,92 @@ pub fn dumpString(
 
     // Emit
     try formatter.format(writer);
+}
+
+const LastLines = struct {
+    top_left: Pin,
+    bottom_right: Pin,
+    trailing_blank_lines: usize,
+};
+
+fn lastLines(self: *const Screen, count: usize) ?LastLines {
+    if (count == 0) return null;
+
+    const active_top = self.pages.getTopLeft(.active);
+    const active_bottom = self.pages.getBottomRight(.active) orelse return null;
+    var active_rows = active_bottom.rowIterator(.left_up, active_top);
+    var last_active_text: ?Pin = null;
+    while (active_rows.next()) |pin| {
+        if (!Cell.hasTextAny(pin.cells(.all))) continue;
+        last_active_text = pin;
+        break;
+    }
+
+    const cursor = self.cursor.page_pin.*;
+    var end = cursor;
+    if (last_active_text) |pin| {
+        if (cursor.before(pin)) end = pin;
+    }
+    if (!Cell.hasTextAny(end.cells(.all))) {
+        end = end.up(1) orelse return null;
+    }
+    end.x = end.node.cols() - 1;
+
+    var rows = end.rowIterator(.left_up, null);
+    var start: ?Pin = null;
+    var remaining = count;
+    var trailing_blank_lines: usize = 0;
+    var trailing = true;
+
+    while (rows.next()) |pin| {
+        const row = pin.rowAndCell().row;
+        if (trailing) {
+            if (Cell.hasTextAny(pin.node.page().getCells(row))) {
+                trailing = false;
+            } else if (!row.wrap_continuation) {
+                trailing_blank_lines += 1;
+            }
+        }
+
+        var line_start = pin;
+        line_start.x = 0;
+        start = line_start;
+
+        if (!row.wrap_continuation) {
+            remaining -= 1;
+            if (remaining == 0) break;
+        }
+    }
+
+    return .{
+        .top_left = start orelse return null,
+        .bottom_right = end,
+        .trailing_blank_lines = trailing_blank_lines,
+    };
+}
+
+pub fn lastLinesString(
+    self: *const Screen,
+    alloc: Allocator,
+    count: usize,
+) Allocator.Error![:0]const u8 {
+    const last_lines = self.lastLines(count) orelse return alloc.dupeZ(u8, "");
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+
+    var formatter: PageListFormatter = .init(&self.pages, .{
+        .emit = .plain,
+        .unwrap = true,
+        .trim = false,
+    });
+    formatter.top_left = last_lines.top_left;
+    formatter.bottom_right = last_lines.bottom_right;
+    formatter.format(&output.writer) catch return error.OutOfMemory;
+
+    const newline_count = last_lines.trailing_blank_lines -|
+        @intFromBool(output.writer.buffered().len == 0);
+    output.writer.splatByteAll('\n', newline_count) catch return error.OutOfMemory;
+    return try output.toOwnedSliceSentinel(0);
 }
 
 /// You should use dumpString, this is a restricted version mostly for
@@ -9341,6 +9428,137 @@ test "Screen: selectLine with scrollback" {
             .y = 2,
         } }, s.pages.pointFromPin(.active, sel.end()).?);
     }
+}
+
+fn expectLastLines(
+    s: *Screen,
+    count: usize,
+    expected: []const u8,
+) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const text = try s.lastLinesString(alloc, count);
+    defer alloc.free(text);
+    try testing.expectEqualStrings(expected, text);
+}
+
+test "Screen: lastLines spans pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(testing.io, alloc, .{
+        .cols = 4,
+        .rows = 2,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+
+    const first_page = s.pages.pages.first.?;
+    first_page.page().pauseIntegrityChecks(true);
+    for (0..first_page.capacity().rows - 1) |_| try s.testWriteString("\n");
+    first_page.page().pauseIntegrityChecks(false);
+    try s.testWriteString("A\nB\nC\n");
+
+    const last_lines = s.lastLines(3).?;
+    try testing.expect(last_lines.top_left.node != last_lines.bottom_right.node);
+    try expectLastLines(&s, 3, "A\nB\nC");
+}
+
+test "Screen: lastLines preserves soft wraps" {
+    const testing = std.testing;
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 5,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+    try s.testWriteString("old\nabcdefghijk\nlast");
+
+    const last_lines = s.lastLines(2).?;
+    const start = last_lines.top_left;
+    try testing.expect(!start.rowAndCell().row.wrap_continuation);
+    try testing.expect(start.down(1).?.rowAndCell().row.wrap_continuation);
+    try expectLastLines(&s, 2, "abcdefghijk\nlast");
+}
+
+test "Screen: lastLines ignores a trailing empty row" {
+    const testing = std.testing;
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 5,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+    try s.testWriteString("one\ntwo\n");
+
+    try expectLastLines(&s, 1, "two");
+}
+
+test "Screen: lastLines preserves a trailing blank line" {
+    const testing = std.testing;
+
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 5,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+    try s.testWriteString("one\ntwo\n\n");
+
+    try expectLastLines(&s, 1, "");
+    try expectLastLines(&s, 2, "two\n");
+    try expectLastLines(&s, 3, "one\ntwo\n");
+}
+
+test "Screen: lastLines preserves repeated trailing blank lines" {
+    const testing = std.testing;
+
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 6,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+    try s.testWriteString("one\ntwo\n\n\n");
+
+    try expectLastLines(&s, 1, "");
+    try expectLastLines(&s, 2, "\n");
+    try expectLastLines(&s, 3, "two\n\n");
+}
+
+test "Screen: lastLines caps at available lines" {
+    const testing = std.testing;
+
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+    try s.testWriteString("one\ntwo\nthree");
+
+    try testing.expect(s.lastLines(0) == null);
+    try expectLastLines(&s, 1, "three");
+    try expectLastLines(&s, 2, "two\nthree");
+    try expectLastLines(&s, 3, "one\ntwo\nthree");
+    try expectLastLines(&s, 100, "one\ntwo\nthree");
+}
+
+test "Screen: lastLinesString reads empty and reset screens" {
+    const testing = std.testing;
+
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+
+    try expectLastLines(&s, 1, "");
+    try s.testWriteString("one\ntwo");
+    s.reset();
+    try expectLastLines(&s, 1, "");
+    try expectLastLines(&s, 100, "");
 }
 
 // https://github.com/mitchellh/ghostty/issues/1329
