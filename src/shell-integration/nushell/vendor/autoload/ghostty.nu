@@ -6,26 +6,27 @@ export module ghostty {
 
   @complete external
   export def --wrapped ssh [...args] {
+    let supaterm_cli = $env.SUPATERM_CLI_PATH? | default ""
+    let ghostty = ($env.GHOSTTY_BIN_DIR? | default "") | path join "ghostty"
+    let ghostty_executable = which $ghostty | is-not-empty
+    if ((which $supaterm_cli | is-not-empty) and (not $ghostty_executable)) {
+      ^$supaterm_cli "ssh" "--" ...$args
+      return
+    }
+
     if not ((has_feature "ssh-env") or (has_feature "ssh-terminfo")) {
       ^ssh ...$args
       return
     }
 
-    let supaterm_cli = $env.SUPATERM_CLI_PATH? | default ""
-    let ghostty = ($env.GHOSTTY_BIN_DIR? | default "") | path join "ghostty"
-    let ghostty_executable = which $ghostty | is-not-empty
-    if (($supaterm_cli | is-not-empty) and (not $ghostty_executable)) {
-      ^$supaterm_cli "ssh" "--" ...$args
-    } else {
-      mut flags = []
-      if not (has_feature "ssh-env") {
-        $flags = ($flags ++ ["--forward-env=false"])
-      }
-      if not (has_feature "ssh-terminfo") {
-        $flags = ($flags ++ ["--terminfo=false"])
-      }
-      ^$ghostty "+ssh" ...$flags "--" ...$args
+    mut flags = []
+    if not (has_feature "ssh-env") {
+      $flags = ($flags ++ ["--forward-env=false"])
     }
+    if not (has_feature "ssh-terminfo") {
+      $flags = ($flags ++ ["--terminfo=false"])
+    }
+    ^$ghostty "+ssh" ...$flags "--" ...$args
   }
 
   # Wrap `sudo` to preserve Ghostty's TERMINFO environment variable

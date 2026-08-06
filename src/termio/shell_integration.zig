@@ -1007,64 +1007,49 @@ test "zsh: missing resources" {
     try testing.expectEqual(0, env.count());
 }
 
-test "shell integration resources route every Supaterm SSH feature without Ghostty executable" {
+test "shell integration resources route SSH through Supaterm without reading shell features" {
     const testing = std.testing;
     const Case = struct {
         source: []const u8,
-        activation: []const u8,
-        supaterm_condition: []const u8,
-        supaterm_command: []const u8,
-        native_command: []const u8,
+        gate: []const u8,
+        command: []const u8,
     };
-    const sh_activation = "[[ \"$GHOSTTY_SHELL_FEATURES\" == *ssh-* ]]";
-    const sh_condition = "[[ -n \"${SUPATERM_CLI_PATH:-}\" && ( -z \"${GHOSTTY_BIN_DIR:-}\" || ! -x \"$GHOSTTY_BIN_DIR/ghostty\" ) ]]";
+    const sh_gate = "[[ -x \"${SUPATERM_CLI_PATH:-}\" && ! -x \"${GHOSTTY_BIN_DIR:-}/ghostty\" ]]";
     const sh_command = "\"$SUPATERM_CLI_PATH\" ssh -- \"$@\"";
     const cases = [_]Case{
         .{
             .source = @embedFile("../shell-integration/bash/ghostty.bash"),
-            .activation = sh_activation,
-            .supaterm_condition = sh_condition,
-            .supaterm_command = sh_command,
-            .native_command = "\"$GHOSTTY_BIN_DIR/ghostty\" +ssh \"${flags[@]}\" -- \"$@\"",
+            .gate = sh_gate,
+            .command = sh_command,
         },
         .{
             .source = @embedFile("../shell-integration/zsh/ghostty-integration"),
-            .activation = sh_activation,
-            .supaterm_condition = sh_condition,
-            .supaterm_command = sh_command,
-            .native_command = "\"$GHOSTTY_BIN_DIR/ghostty\" +ssh $flags -- \"$@\"",
+            .gate = sh_gate,
+            .command = sh_command,
         },
         .{
             .source = @embedFile("../shell-integration/fish/vendor_conf.d/ghostty-shell-integration.fish"),
-            .activation = "contains ssh-env $features; or contains ssh-terminfo $features",
-            .supaterm_condition = "not test -x \"$ghostty\"; and set -q SUPATERM_CLI_PATH; and test -n \"$SUPATERM_CLI_PATH\"",
-            .supaterm_command = "\"$SUPATERM_CLI_PATH\" ssh -- $argv",
-            .native_command = "\"$ghostty\" +ssh $flags -- $argv",
+            .gate = "if test -x \"$SUPATERM_CLI_PATH\"; and not test -x \"$GHOSTTY_BIN_DIR/ghostty\"",
+            .command = "\"$SUPATERM_CLI_PATH\" ssh -- $argv",
         },
         .{
             .source = @embedFile("../shell-integration/elvish/lib/ghostty-integration.elv"),
-            .activation = "(and (str:contains $E:GHOSTTY_SHELL_FEATURES ssh-) (has-external ssh))",
-            .supaterm_condition = "(and (not (has-external $ghostty)) (has-env SUPATERM_CLI_PATH) (not-eq $E:SUPATERM_CLI_PATH \"\"))",
-            .supaterm_command = "$E:SUPATERM_CLI_PATH ssh -- $@args",
-            .native_command = "$ghostty +ssh $@flags -- $@args",
+            .gate = "(and (has-external ssh) (has-env SUPATERM_CLI_PATH) (not-eq $E:SUPATERM_CLI_PATH \"\") (not (has-external $ghostty-bin)))",
+            .command = "$E:SUPATERM_CLI_PATH ssh -- $@args",
         },
         .{
             .source = @embedFile("../shell-integration/nushell/vendor/autoload/ghostty.nu"),
-            .activation = "if not ((has_feature \"ssh-env\") or (has_feature \"ssh-terminfo\"))",
-            .supaterm_condition = "if (($supaterm_cli | is-not-empty) and (not $ghostty_executable))",
-            .supaterm_command = "^$supaterm_cli \"ssh\" \"--\" ...$args",
-            .native_command = "^$ghostty \"+ssh\" ...$flags \"--\" ...$args",
+            .gate = "if ((which $supaterm_cli | is-not-empty) and (not $ghostty_executable))",
+            .command = "^$supaterm_cli \"ssh\" \"--\" ...$args",
         },
     };
 
     for (cases) |case| {
-        try testing.expect(std.mem.indexOf(u8, case.source, case.activation) != null);
-        const condition_start = std.mem.indexOf(u8, case.source, case.supaterm_condition).?;
-        const native_start = std.mem.indexOfPos(u8, case.source, condition_start, "else").?;
-        const supaterm_branch = case.source[condition_start..native_start];
-        try testing.expect(std.mem.indexOf(u8, supaterm_branch, case.supaterm_command) != null);
-        try testing.expect(std.mem.indexOf(u8, supaterm_branch, "+ssh") == null);
-        try testing.expect(std.mem.indexOfPos(u8, case.source, native_start, case.native_command) != null);
+        try testing.expect(std.mem.indexOf(u8, case.gate, "GHOSTTY_SHELL_FEATURES") == null);
+        try testing.expect(std.mem.indexOf(u8, case.source, case.gate) != null);
+        const command_start = std.mem.indexOf(u8, case.source, case.command).?;
+        const native_start = std.mem.indexOf(u8, case.source, "+ssh").?;
+        try testing.expect(command_start < native_start);
     }
 }
 
