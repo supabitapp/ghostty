@@ -116,17 +116,17 @@ fi
 
 # SSH Integration
 #
-if [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-* ]]; then
+if [[ -x "${SUPATERM_CLI_PATH:-}" && ! -x "${GHOSTTY_BIN_DIR:-}/ghostty" ]]; then
   function ssh() {
-    if [[ -n "${SUPATERM_CLI_PATH:-}" && ( -z "${GHOSTTY_BIN_DIR:-}" || ! -x "$GHOSTTY_BIN_DIR/ghostty" ) ]]; then
-      "$SUPATERM_CLI_PATH" ssh -- "$@"
-    else
-      builtin local -a flags
-      flags=()
-      [[ "$GHOSTTY_SHELL_FEATURES" != *ssh-env* ]] && flags+=(--forward-env=false)
-      [[ "$GHOSTTY_SHELL_FEATURES" != *ssh-terminfo* ]] && flags+=(--terminfo=false)
-      "$GHOSTTY_BIN_DIR/ghostty" +ssh "${flags[@]}" -- "$@"
-    fi
+    "$SUPATERM_CLI_PATH" ssh -- "$@"
+  }
+elif [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-* ]]; then
+  function ssh() {
+    builtin local -a flags
+    flags=()
+    [[ "$GHOSTTY_SHELL_FEATURES" != *ssh-env* ]] && flags+=(--forward-env=false)
+    [[ "$GHOSTTY_SHELL_FEATURES" != *ssh-terminfo* ]] && flags+=(--terminfo=false)
+    "$GHOSTTY_BIN_DIR/ghostty" +ssh "${flags[@]}" -- "$@"
   }
 fi
 

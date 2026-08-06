@@ -122,21 +122,21 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
     # SSH Integration
     #
     set -l features (string split ',' -- "$GHOSTTY_SHELL_FEATURES")
-    if contains ssh-env $features; or contains ssh-terminfo $features
+    if test -x "$SUPATERM_CLI_PATH"; and not test -x "$GHOSTTY_BIN_DIR/ghostty"
+        function ssh --wraps=ssh --description "SSH wrapper with Supaterm integration"
+            "$SUPATERM_CLI_PATH" ssh -- $argv
+        end
+    else if contains ssh-env $features; or contains ssh-terminfo $features
         function ssh --wraps=ssh --description "SSH wrapper with Ghostty integration"
             set -l features (string split ',' -- "$GHOSTTY_SHELL_FEATURES")
             set -l ghostty /ghostty
             if set -q GHOSTTY_BIN_DIR; and test -n "$GHOSTTY_BIN_DIR"
                 set ghostty "$GHOSTTY_BIN_DIR/ghostty"
             end
-            if not test -x "$ghostty"; and set -q SUPATERM_CLI_PATH; and test -n "$SUPATERM_CLI_PATH"
-                "$SUPATERM_CLI_PATH" ssh -- $argv
-            else
-                set -l flags
-                contains ssh-env $features; or set -a flags --forward-env=false
-                contains ssh-terminfo $features; or set -a flags --terminfo=false
-                "$ghostty" +ssh $flags -- $argv
-            end
+            set -l flags
+            contains ssh-env $features; or set -a flags --forward-env=false
+            contains ssh-terminfo $features; or set -a flags --terminfo=false
+            "$ghostty" +ssh $flags -- $argv
         end
     end
 
