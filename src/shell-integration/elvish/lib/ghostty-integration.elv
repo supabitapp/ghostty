@@ -84,7 +84,7 @@
   }
 
   fn ssh-supaterm {|@args|
-    $E:SUPATERM_CLI_PATH ssh -- $@args
+    $E:SUPATERM_CLI_PATH internal ssh -- $@args
   }
 
   fn ssh-integration {|@args|
