@@ -1,0 +1,42 @@
+name: Fork CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes expect fish zsh
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654
+        with:
+          version: 2026.7.13
+          install: false
+      - name: Read Zig version
+        run: echo "GHOSTTY_ZIG_VERSION=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_ENV"
+      - name: Check workflow
+        run: |
+          mise x actionlint@1.7.7 -- actionlint .github/workflows/fork.yml
+          mise x npm:prettier@3.6.2 -- prettier --check .github/workflows/fork.yml
+      - name: Check shell code
+        run: mise x shellcheck@0.11.0 -- shellcheck src/shell-integration/bash/ghostty.bash test/shell-integration/supaterm-ssh.bash
+      - name: Test shell integration
+        run: mise x aqua:nushell/nushell@0.114.1 go:src.elv.sh/cmd/elvish@v0.21.0 -- test/shell-integration/supaterm-ssh.bash
+      - name: Check Zig format
+        run: mise x "zig@$GHOSTTY_ZIG_VERSION" -- zig fmt --check .
+      - name: Test Zig
+        run: mise x "zig@$GHOSTTY_ZIG_VERSION" -- zig build -Dapp-runtime=none test
