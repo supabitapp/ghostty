@@ -417,6 +417,7 @@ pub const Surface = struct {
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
+    command_wrapper: ?CommandWrapper = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -468,46 +469,87 @@ pub const Surface = struct {
         command_wrapper_count: usize = 0,
     };
 
-    fn applyCommandWrapper(config: *Config, opts: Options) !void {
-        const command_wrapper = opts.command_wrapper orelse return;
-        if (opts.command_wrapper_count == 0) return;
+    const CommandWrapper = struct {
+        args: []const [*:0]const u8,
 
-        const alloc = config.arenaAlloc();
-        const args = try alloc.alloc([:0]const u8, opts.command_wrapper_count);
-        for (command_wrapper[0..opts.command_wrapper_count], 0..) |arg, i| {
-            args[i] = try alloc.dupeZ(u8, std.mem.sliceTo(arg, 0));
+        fn init(
+            alloc: Allocator,
+            source: ?[*]const [*:0]const u8,
+            count: usize,
+        ) Allocator.Error!?CommandWrapper {
+            const source_args = source orelse return null;
+            if (count == 0) return null;
+
+            const args = try alloc.alloc([*:0]const u8, count);
+            errdefer alloc.free(args);
+
+            var initialized: usize = 0;
+            errdefer for (args[0..initialized]) |arg| alloc.free(std.mem.span(arg));
+
+            for (source_args[0..count], args) |source_arg, *arg| {
+                arg.* = (try alloc.dupeZ(u8, std.mem.span(source_arg))).ptr;
+                initialized += 1;
+            }
+
+            return .{ .args = args };
         }
-        config.@"command-wrapper" = .{ .direct = args };
-    }
 
-    test "Surface.Options command wrapper reaches Exec.Config" {
+        fn deinit(self: CommandWrapper, alloc: Allocator) void {
+            for (self.args) |arg| alloc.free(std.mem.span(arg));
+            alloc.free(self.args);
+        }
+
+        fn inherit(self: CommandWrapper, opts: *Options) void {
+            opts.command_wrapper = self.args.ptr;
+            opts.command_wrapper_count = self.args.len;
+        }
+    };
+
+    test "Surface command wrapper owns and inherits argv" {
         const testing = std.testing;
-        var config = try Config.default(testing.allocator);
-        defer config.deinit();
+        var executable = "/tmp/zmx".*;
+        const source = [_][*:0]const u8{ &executable, "attach", "spt-session" };
 
-        const command_wrapper = [_][*:0]const u8{
-            "/Applications/Supaterm.app/Contents/Resources/bin/zmx",
-            "attach",
-            "spt-session",
+        var child = child: {
+            const parent = (try CommandWrapper.init(
+                testing.allocator,
+                &source,
+                source.len,
+            )).?;
+            defer parent.deinit(testing.allocator);
+
+            executable[5] = 'X';
+            try testing.expectEqualStrings("/tmp/zmx", std.mem.span(parent.args[0]));
+
+            var inherited: Options = .{};
+            parent.inherit(&inherited);
+            try testing.expectEqual(
+                @intFromPtr(parent.args.ptr),
+                @intFromPtr(inherited.command_wrapper.?),
+            );
+
+            break :child (try CommandWrapper.init(
+                testing.allocator,
+                inherited.command_wrapper,
+                inherited.command_wrapper_count,
+            )).?;
         };
-        try applyCommandWrapper(&config, .{
-            .command_wrapper = &command_wrapper,
-            .command_wrapper_count = command_wrapper.len,
-        });
+        defer child.deinit(testing.allocator);
 
-        const exec_wrapper: @FieldType(
-            @import("../termio/Exec.zig").Config,
-            "command_wrapper",
-        ) = config.@"command-wrapper";
-        const args = exec_wrapper.?.direct;
-
-        try testing.expectEqual(command_wrapper.len, args.len);
-        for (command_wrapper, args) |expected, actual| {
-            try testing.expectEqualStrings(std.mem.sliceTo(expected, 0), actual);
-        }
+        try testing.expectEqualStrings("/tmp/zmx", std.mem.span(child.args[0]));
+        try testing.expectEqualStrings("attach", std.mem.span(child.args[1]));
+        try testing.expectEqualStrings("spt-session", std.mem.span(child.args[2]));
     }
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
+        const surface_alloc = app.core_app.alloc;
+        const command_wrapper = try CommandWrapper.init(
+            surface_alloc,
+            opts.command_wrapper,
+            opts.command_wrapper_count,
+        );
+        errdefer if (command_wrapper) |wrapper| wrapper.deinit(surface_alloc);
+
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
@@ -519,6 +561,7 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .command_wrapper = command_wrapper,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -579,8 +622,6 @@ pub const Surface = struct {
             }
         }
 
-        try applyCommandWrapper(&config, opts);
-
         // Apply any environment variables that were requested.
         if (opts.env_var_count > 0) {
             const alloc = config.arenaAlloc();
@@ -623,8 +664,9 @@ pub const Surface = struct {
         // Initialize our surface right away. We're given a view that is
         // ready to use.
         try self.core_surface.init(
-            app.core_app.alloc,
+            surface_alloc,
             &config,
+            .{ .command_wrapper = if (command_wrapper) |wrapper| wrapper.args else &.{} },
             app.core_app,
             app,
             self,
@@ -651,6 +693,8 @@ pub const Surface = struct {
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
+
+        if (self.command_wrapper) |wrapper| wrapper.deinit(self.app.core_app.alloc);
     }
 
     /// Initialize the inspector instance. A surface can only have one
@@ -988,11 +1032,13 @@ pub const Surface = struct {
             break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
         };
 
-        return .{
+        var opts: apprt.Surface.Options = .{
             .font_size = font_size,
             .working_directory = working_directory,
             .context = context,
         };
+        if (self.command_wrapper) |wrapper| wrapper.inherit(&opts);
+        return opts;
     }
 
     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
@@ -1684,18 +1730,14 @@ pub const CAPI = struct {
         lines: u32,
         result: *Text,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
-        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
-
-        const screen = surface.core_surface.renderer_state.terminal.screens.active;
-        const text = screen.lastLinesString(
+        const text = surface.core_surface.dumpTextTail(
             global.alloc(),
             @intCast(lines),
         ) catch |err| {
             log.warn("error reading text tail err={}", .{err});
             return false;
         };
-        takeTextResult(result, .{ .text = text });
+        takeTextResult(result, text);
         return true;
     }
 

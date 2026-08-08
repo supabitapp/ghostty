@@ -567,7 +567,7 @@ pub const ThreadData = struct {
 
 pub const Config = struct {
     command: ?configpkg.Command = null,
-    command_wrapper: ?configpkg.Command = null,
+    command_wrapper: []const [*:0]const u8 = &.{},
     env: EnvMap,
     env_override: configpkg.RepeatableStringMap = .{},
     shell_integration: configpkg.Config.ShellIntegration = .detect,
@@ -2068,19 +2068,16 @@ pub fn getProcessInfo(self: *Exec, comptime info: ProcessInfo) ?ProcessInfo.Type
 fn wrappedCommandArgs(
     alloc: Allocator,
     base_args: []const [:0]const u8,
-    wrapper: ?configpkg.Command,
+    wrapper: []const [*:0]const u8,
 ) Allocator.Error![]const [:0]const u8 {
-    const command = wrapper orelse return base_args;
-    var args: std.ArrayList([:0]const u8) = .empty;
-    defer args.deinit(alloc);
+    if (wrapper.len == 0) return base_args;
 
-    var iterator = try command.argIterator(alloc);
-    defer iterator.deinit();
-    while (iterator.next()) |arg| {
-        try args.append(alloc, try alloc.dupeZ(u8, arg));
+    const args = try alloc.alloc([:0]const u8, wrapper.len + base_args.len);
+    for (wrapper, args[0..wrapper.len]) |arg, *result| {
+        result.* = std.mem.span(arg);
     }
-    try args.appendSlice(alloc, base_args);
-    return try args.toOwnedSlice(alloc);
+    @memcpy(args[wrapper.len..], base_args);
+    return args;
 }
 
 test "wrappedCommandArgs prepends wrapper arguments" {
@@ -2090,11 +2087,15 @@ test "wrappedCommandArgs prepends wrapper arguments" {
     const alloc = arena.allocator();
 
     const base_args: []const [:0]const u8 = &.{ "/bin/zsh", "-l" };
-    const result = try wrappedCommandArgs(alloc, base_args, .{ .direct = &.{
+    const unwrapped = try wrappedCommandArgs(alloc, base_args, &.{});
+    try testing.expectEqual(@intFromPtr(base_args.ptr), @intFromPtr(unwrapped.ptr));
+
+    const wrapper = [_][*:0]const u8{
         "/Applications/Supaterm.app/Contents/Helpers/zmx",
         "attach",
         "spt-session",
-    } });
+    };
+    const result = try wrappedCommandArgs(alloc, base_args, &wrapper);
 
     try testing.expectEqual(5, result.len);
     try testing.expectEqualStrings("/Applications/Supaterm.app/Contents/Helpers/zmx", result[0]);
@@ -2102,6 +2103,7 @@ test "wrappedCommandArgs prepends wrapper arguments" {
     try testing.expectEqualStrings("spt-session", result[2]);
     try testing.expectEqualStrings("/bin/zsh", result[3]);
     try testing.expectEqualStrings("-l", result[4]);
+    try testing.expectEqual(@intFromPtr(wrapper[0]), @intFromPtr(result[0].ptr));
 }
 
 test "execCommand darwin: shell command" {
