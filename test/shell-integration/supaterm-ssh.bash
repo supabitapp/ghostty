@@ -46,7 +46,7 @@ assert_route() {
   printf '%s\n' "$shell_name route passed"
 }
 
-printf '%s\n' ssh -- -p 2222 'user@example host' >"$expected_path"
+printf '%s\n' internal ssh -- -p 2222 'user@example host' >"$expected_path"
 
 "${test_env[@]}" bash --noprofile --norc -i -c \
   "source \"\$1\"; ssh -p 2222 \"user@example host\"" \

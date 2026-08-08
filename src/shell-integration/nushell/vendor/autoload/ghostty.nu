@@ -10,7 +10,7 @@ export module ghostty {
     let ghostty = ($env.GHOSTTY_BIN_DIR? | default "") | path join "ghostty"
     let ghostty_executable = which $ghostty | is-not-empty
     if ((which $supaterm_cli | is-not-empty) and (not $ghostty_executable)) {
-      ^$supaterm_cli "ssh" "--" ...$args
+      ^$supaterm_cli "internal" "ssh" "--" ...$args
       return
     }
 

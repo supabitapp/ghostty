@@ -124,7 +124,7 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
     set -l features (string split ',' -- "$GHOSTTY_SHELL_FEATURES")
     if test -x "$SUPATERM_CLI_PATH"; and not test -x "$GHOSTTY_BIN_DIR/ghostty"
         function ssh --wraps=ssh --description "SSH wrapper with Supaterm integration"
-            "$SUPATERM_CLI_PATH" ssh -- $argv
+            "$SUPATERM_CLI_PATH" internal ssh -- $argv
         end
     else if contains ssh-env $features; or contains ssh-terminfo $features
         function ssh --wraps=ssh --description "SSH wrapper with Ghostty integration"

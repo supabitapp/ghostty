@@ -118,7 +118,7 @@ fi
 #
 if [[ -x "${SUPATERM_CLI_PATH:-}" && ! -x "${GHOSTTY_BIN_DIR:-}/ghostty" ]]; then
   function ssh() {
-    "$SUPATERM_CLI_PATH" ssh -- "$@"
+    "$SUPATERM_CLI_PATH" internal ssh -- "$@"
   }
 elif [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-* ]]; then
   function ssh() {
