@@ -3537,6 +3537,7 @@ pub const Surface = extern struct {
         surface.init(
             alloc,
             &config,
+            .{},
             app.core(),
             app.rt(),
             &priv.rt_surface,
