@@ -465,6 +465,42 @@ pub const Surface = struct {
         command_wrapper_count: usize = 0,
     };
 
+    fn applyCommand(config: *Config, command: ?[*:0]const u8) void {
+        const c_command = command orelse return;
+        const cmd = std.mem.sliceTo(c_command, 0);
+        if (cmd.len > 0) config.command = .{ .shell = cmd };
+    }
+
+    test "surface command does not imply wait after command" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+        const command = try config.arenaAlloc().dupeZ(u8, "echo ready");
+
+        applyCommand(&config, command.ptr);
+
+        try testing.expect(config.command != null);
+        try testing.expect(!config.@"wait-after-command");
+    }
+
+    fn freeInheritedOptions(alloc: Allocator, opts: *Options) void {
+        if (opts.working_directory) |working_directory| {
+            alloc.free(std.mem.span(working_directory));
+            opts.working_directory = null;
+        }
+    }
+
+    test "inherited options free owned working directory" {
+        const testing = std.testing;
+        var opts: Options = .{
+            .working_directory = (try testing.allocator.dupeZ(u8, "/tmp")).ptr,
+        };
+
+        freeInheritedOptions(testing.allocator, &opts);
+
+        try testing.expect(opts.working_directory == null);
+    }
+
     const CommandWrapper = struct {
         args: []const [*:0]const u8,
 
@@ -609,13 +645,7 @@ pub const Surface = struct {
             }
         }
 
-        // If we have a command from the options then we set it.
-        if (opts.command) |c_command| {
-            const cmd = std.mem.sliceTo(c_command, 0);
-            if (cmd.len > 0) {
-                config.command = .{ .shell = cmd };
-            }
-        }
+        applyCommand(&config, opts.command);
 
         // Apply any environment variables that were requested.
         if (opts.env_var_count > 0) {
@@ -1655,6 +1685,13 @@ pub const CAPI = struct {
         source: apprt.surface.NewSurfaceContext,
     ) Surface.Options {
         return surface.newSurfaceOptions(source);
+    }
+
+    export fn ghostty_surface_inherited_config_free(
+        surface: *Surface,
+        opts: *Surface.Options,
+    ) void {
+        Surface.freeInheritedOptions(surface.app.core_app.alloc, opts);
     }
 
     /// Update the configuration to the provided config for only this surface.
