@@ -442,14 +442,10 @@ pub const Surface = struct {
         /// The working directory to load into.
         working_directory: ?[*:0]const u8 = null,
 
-        /// The command to run in the new surface. If this is set then
-        /// the "wait-after-command" option is also automatically set to true,
-        /// since this is used for scripting.
+        /// The command to run in the new surface.
         ///
         /// This command always run in a shell (e.g. via `/bin/sh -c`),
         /// despite Ghostty allowing directly executed commands via config.
-        /// This is a legacy thing and we should probably change it in the
-        /// future once we have a concrete use case.
         command: ?[*:0]const u8 = null,
 
         /// Extra environment variables to set for the surface.
@@ -618,7 +614,6 @@ pub const Surface = struct {
             const cmd = std.mem.sliceTo(c_command, 0);
             if (cmd.len > 0) {
                 config.command = .{ .shell = cmd };
-                config.@"wait-after-command" = true;
             }
         }
 
