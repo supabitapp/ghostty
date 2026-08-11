@@ -1148,6 +1148,16 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             self.command_timer = .now(global.io(), .awake);
         },
 
+        .shell_ready => {
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .shell_ready,
+                {},
+            ) catch |err| {
+                log.warn("apprt failed to notify shell readiness={}", .{err});
+            };
+        },
+
         .stop_command => |v| timer: {
             const end: std.Io.Timestamp = .now(global.io(), .awake);
             const start = self.command_timer orelse break :timer;

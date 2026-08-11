@@ -992,6 +992,12 @@ pub const StreamHandler = struct {
         cmd: Stream.Action.SemanticPrompt,
     ) !void {
         switch (cmd.action) {
+            .end_prompt_start_input,
+            .end_prompt_start_input_terminate_eol,
+            => {
+                self.surfaceMessageWriter(.shell_ready);
+            },
+
             .end_input_start_output => {
                 self.surfaceMessageWriter(.start_command);
             },
@@ -1009,8 +1015,6 @@ pub const StreamHandler = struct {
             },
 
             // Handled by Terminal, no special handling by us
-            .end_prompt_start_input,
-            .end_prompt_start_input_terminate_eol,
             .fresh_line,
             .fresh_line_new_prompt,
             .new_command,
