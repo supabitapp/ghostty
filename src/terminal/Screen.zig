@@ -2880,6 +2880,147 @@ pub const SelectionString = struct {
     map: ?*StringMap = null,
 };
 
+const SuffixWriter = struct {
+    writer: std.Io.Writer,
+    storage: []u8,
+    start: usize = 0,
+    len: usize = 0,
+
+    fn init(storage: []u8) SuffixWriter {
+        return .{
+            .writer = .{
+                .buffer = &.{},
+                .vtable = &.{ .drain = drain },
+            },
+            .storage = storage,
+        };
+    }
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *SuffixWriter = @fieldParentPtr("writer", writer);
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.append(bytes);
+            written += bytes.len;
+        }
+        for (0..splat) |_| {
+            const bytes = data[data.len - 1];
+            self.append(bytes);
+            written += bytes.len;
+        }
+        return written;
+    }
+
+    fn append(self: *SuffixWriter, bytes: []const u8) void {
+        const capacity = self.storage.len;
+        if (capacity == 0 or bytes.len == 0) return;
+        if (bytes.len >= capacity) {
+            @memcpy(self.storage, bytes[bytes.len - capacity ..]);
+            self.start = 0;
+            self.len = capacity;
+            return;
+        }
+
+        const available = capacity - self.len;
+        const initial_len = @min(available, bytes.len);
+        @memcpy(
+            self.storage[self.len..][0..initial_len],
+            bytes[0..initial_len],
+        );
+        self.len += initial_len;
+        if (initial_len == bytes.len) return;
+
+        const remaining = bytes[initial_len..];
+        const first_len = @min(remaining.len, capacity - self.start);
+        @memcpy(
+            self.storage[self.start..][0..first_len],
+            remaining[0..first_len],
+        );
+        @memcpy(
+            self.storage[0 .. remaining.len - first_len],
+            remaining[first_len..],
+        );
+        self.start = (self.start + remaining.len) % capacity;
+    }
+
+    fn finish(self: *SuffixWriter) []u8 {
+        if (self.start > 0) {
+            std.mem.rotate(u8, self.storage[0..self.len], self.start);
+        }
+        return self.storage[0..self.len];
+    }
+};
+
+const UTF8SuffixStartWriter = struct {
+    writer: std.Io.Writer,
+    candidate: usize,
+    offset: usize = 0,
+    start: ?usize = null,
+
+    fn init(candidate: usize) UTF8SuffixStartWriter {
+        return .{
+            .writer = .{
+                .buffer = &.{},
+                .vtable = &.{ .drain = drain },
+            },
+            .candidate = candidate,
+        };
+    }
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *UTF8SuffixStartWriter = @fieldParentPtr("writer", writer);
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.scan(bytes);
+            written += bytes.len;
+        }
+        for (0..splat) |_| {
+            const bytes = data[data.len - 1];
+            self.scan(bytes);
+            written += bytes.len;
+        }
+        return written;
+    }
+
+    fn scan(self: *UTF8SuffixStartWriter, bytes: []const u8) void {
+        if (self.start == null and self.offset + bytes.len > self.candidate) {
+            const first = self.candidate -| self.offset;
+            for (bytes[first..], first..) |byte, index| {
+                if (byte & 0xC0 != 0x80) {
+                    self.start = self.offset + index;
+                    break;
+                }
+            }
+        }
+        self.offset += bytes.len;
+    }
+};
+
+fn selectionFormatter(
+    self: *Screen,
+    sel: Selection,
+    trim: bool,
+) ScreenFormatter {
+    var formatter: ScreenFormatter = .init(
+        self,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = trim,
+        },
+    );
+    formatter.content = .{ .selection = sel };
+    return formatter;
+}
+
 const selectionString_tw = tripwire.module(enum {
     copy_map,
 }, selectionString);
@@ -2899,15 +3040,7 @@ pub fn selectionString(
     defer aw.deinit();
 
     // Create a formatter and use that to emit our text.
-    var formatter: ScreenFormatter = .init(
-        self,
-        .{
-            .emit = .plain,
-            .unwrap = true,
-            .trim = opts.trim,
-        },
-    );
-    formatter.content = .{ .selection = opts.sel };
+    var formatter = self.selectionFormatter(opts.sel, opts.trim);
 
     // If we have a string map, we need to set that up.
     var pins: PinMap.Map = .empty;
@@ -2938,6 +3071,42 @@ pub fn selectionString(
     }
 
     return text;
+}
+
+pub fn selectionStringSuffix(
+    self: *Screen,
+    alloc: Allocator,
+    sel: Selection,
+    maximum_bytes: usize,
+) Allocator.Error![:0]const u8 {
+    var discarding: std.Io.Writer.Discarding = .init(&.{});
+    var formatter = self.selectionFormatter(sel, false);
+    formatter.format(&discarding.writer) catch unreachable;
+
+    const total_len = std.math.cast(usize, discarding.fullCount()) orelse
+        return error.OutOfMemory;
+    const candidate = total_len - @min(total_len, maximum_bytes);
+    const suffix_start: usize = if (candidate == 0 or candidate == total_len)
+        candidate
+    else suffix_start: {
+        var boundary: UTF8SuffixStartWriter = .init(candidate);
+        formatter = self.selectionFormatter(sel, false);
+        formatter.format(&boundary.writer) catch unreachable;
+        break :suffix_start boundary.start orelse total_len;
+    };
+    const payload_len = total_len - suffix_start;
+    const allocation_len = std.math.add(usize, payload_len, 1) catch
+        return error.OutOfMemory;
+    const allocation = try alloc.alloc(u8, allocation_len);
+    errdefer alloc.free(allocation);
+
+    var suffix: SuffixWriter = .init(allocation[0..payload_len]);
+    formatter = self.selectionFormatter(sel, false);
+    formatter.format(&suffix.writer) catch unreachable;
+    const text = suffix.finish();
+    assert(text.len == payload_len);
+    allocation[text.len] = 0;
+    return allocation[0..text.len :0];
 }
 
 pub const SelectLine = struct {
@@ -10662,6 +10831,67 @@ test "Screen: selectionString soft wrap" {
         const expected = "2EFGH3IJ";
         try testing.expectEqualStrings(expected, contents);
     }
+}
+
+test "Screen: selectionStringSuffix byte caps and UTF-8" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 12, .rows = 1, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("prefix-🙂Z");
+
+    const sel = Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 9, .y = 0 } }).?,
+        false,
+    );
+    const cases = [_]struct {
+        maximum_bytes: usize,
+        expected: []const u8,
+    }{
+        .{ .maximum_bytes = 12, .expected = "prefix-🙂Z" },
+        .{ .maximum_bytes = 5, .expected = "🙂Z" },
+        .{ .maximum_bytes = 4, .expected = "Z" },
+        .{ .maximum_bytes = 1, .expected = "Z" },
+        .{ .maximum_bytes = 0, .expected = "" },
+    };
+    for (cases) |case| {
+        const contents = try s.selectionStringSuffix(
+            alloc,
+            sel,
+            case.maximum_bytes,
+        );
+        defer alloc.free(contents);
+        try testing.expect(contents.len <= case.maximum_bytes);
+        try testing.expect(std.unicode.utf8ValidateSlice(contents));
+        try testing.expectEqualStrings(case.expected, contents);
+    }
+
+    var backing: [6]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    const contents = try s.selectionStringSuffix(fixed.allocator(), sel, 5);
+    try testing.expectEqualStrings("🙂Z", contents);
+}
+
+test "Screen: selectionStringSuffix preserves whitespace and soft wraps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("1AB  \n2EFGH3IJKL");
+
+    const sel = Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 4, .y = 2 } }).?,
+        false,
+    );
+    const contents = try s.selectionStringSuffix(alloc, sel, 13);
+    defer alloc.free(contents);
+    try testing.expectEqualStrings("  \n2EFGH3IJKL", contents);
 }
 
 test "Screen: selectionString wide char" {

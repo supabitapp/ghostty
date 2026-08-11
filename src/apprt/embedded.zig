@@ -1757,6 +1757,31 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
+    export fn ghostty_surface_read_text_suffix(
+        surface: *Surface,
+        sel: Selection,
+        maximum_bytes: usize,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+
+        const core_sel = sel.core(
+            core_surface.renderer_state.terminal.screens.active,
+        ) orelse return false;
+        const text = core_surface.io.terminal.screens.active.selectionStringSuffix(
+            global.alloc(),
+            core_sel,
+            maximum_bytes,
+        ) catch |err| {
+            log.warn("error reading text suffix err={}", .{err});
+            return false;
+        };
+        takeTextResult(result, .{ .text = text });
+        return true;
+    }
+
     export fn ghostty_surface_read_text_tail(
         surface: *Surface,
         lines: u32,
