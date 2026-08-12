@@ -667,7 +667,6 @@ const Subprocess = struct {
             try env.put("COLORTERM", "truecolor");
         }
 
-        // Add our binary to the path if we can find it.
         ghostty_path: {
             // Skip this for flatpak since host cannot reach them
             if ((comptime build_config.flatpak) and
@@ -685,30 +684,7 @@ const Subprocess = struct {
                 break :ghostty_path;
             }];
             const exe_dir = std.fs.path.dirname(exe_bin_path) orelse break :ghostty_path;
-            log.debug("appending ghostty bin to path dir={s}", .{exe_dir});
-
-            // We always set this so that if the shell overwrites the path
-            // scripts still have a way to find the Ghostty binary when
-            // running in Ghostty.
-            try env.put("GHOSTTY_BIN_DIR", exe_dir);
-
-            // Append if we have a path. We want to append so that ghostty is
-            // the last priority in the path. If we don't have a path set
-            // then we just set it to the directory of the binary.
-            if (env.get("PATH")) |path| {
-                // Verify that our path doesn't already contain this entry
-                var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
-                while (it.next()) |entry| {
-                    if (std.mem.eql(u8, entry, exe_dir)) break :ghostty_path;
-                }
-
-                try env.put(
-                    "PATH",
-                    try appendEnv(alloc, path, exe_dir),
-                );
-            } else {
-                try env.put("PATH", exe_dir);
-            }
+            try configureGhosttyEnvironment(alloc, &env, cfg.command, exe_dir);
         }
 
         // On macOS, export additional data directories from our
@@ -2060,6 +2036,32 @@ fn appendEnvAlways(
     });
 }
 
+fn configureGhosttyEnvironment(
+    alloc: Allocator,
+    env: *EnvMap,
+    command: ?configpkg.Command,
+    exe_dir: []const u8,
+) Allocator.Error!void {
+    try env.put("GHOSTTY_BIN_DIR", exe_dir);
+
+    if (command) |value| switch (value) {
+        .direct => return,
+        .shell => {},
+    };
+
+    log.debug("appending ghostty bin to path dir={s}", .{exe_dir});
+    if (env.get("PATH")) |path| {
+        var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry, exe_dir)) return;
+        }
+
+        try env.put("PATH", try appendEnv(alloc, path, exe_dir));
+    } else {
+        try env.put("PATH", exe_dir);
+    }
+}
+
 /// Get information about the process(es) running within the backend. Returns
 /// `null` if there was an error getting the information or the information is
 /// not available on a particular platform.
@@ -2106,6 +2108,48 @@ test "wrappedCommandArgs prepends wrapper arguments" {
     try testing.expectEqualStrings("/bin/zsh", result[3]);
     try testing.expectEqualStrings("-l", result[4]);
     try testing.expectEqual(@intFromPtr(wrapper[0]), @intFromPtr(result[0].ptr));
+}
+
+test "direct command preserves PATH" {
+    const testing = std.testing;
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", "");
+
+    try configureGhosttyEnvironment(
+        testing.allocator,
+        &env,
+        .{ .direct = &.{"command"} },
+        "/ghostty/bin",
+    );
+
+    try testing.expectEqualStrings("", env.get("PATH").?);
+    try testing.expectEqualStrings("/ghostty/bin", env.get("GHOSTTY_BIN_DIR").?);
+}
+
+test "shell command appends Ghostty bin to PATH" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", "/usr/bin");
+
+    try configureGhosttyEnvironment(
+        arena.allocator(),
+        &env,
+        .{ .shell = "zsh" },
+        "/ghostty/bin",
+    );
+
+    const expected = try std.fmt.allocPrint(
+        testing.allocator,
+        "/usr/bin{c}/ghostty/bin",
+        .{std.fs.path.delimiter},
+    );
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, env.get("PATH").?);
+    try testing.expectEqualStrings("/ghostty/bin", env.get("GHOSTTY_BIN_DIR").?);
 }
 
 test "execCommand darwin: shell command" {

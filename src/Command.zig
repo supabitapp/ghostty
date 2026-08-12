@@ -934,7 +934,7 @@ test "Command: custom env vars" {
     }
 }
 
-test "Command: empty custom PATH component resolves executable from cwd" {
+test "Command: empty custom PATH resolves executable from cwd" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     var td = try TempDir.init();
@@ -947,7 +947,7 @@ test "Command: empty custom PATH component resolves executable from cwd" {
     defer testing.allocator.free(cwd);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
-    try env.put("PATH", ":");
+    try env.put("PATH", "");
 
     var cmd: Command = .{
         .path = "ghostty-custom-path-command",
