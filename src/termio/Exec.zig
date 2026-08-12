@@ -2023,7 +2023,7 @@ fn execCommand(
                 try args.append(alloc, "-c");
             }
 
-            try args.append(alloc, v);
+            try args.append(alloc, try alloc.dupeZ(u8, v));
             break :shell try args.toOwnedSlice(alloc);
         },
     };
@@ -2242,6 +2242,25 @@ test "execCommand: shell command, error passwd" {
     try testing.expectEqual(3, result.len);
     try testing.expectEqualStrings(result[0], "/bin/sh");
     try testing.expectEqualStrings(result[1], "-c");
+    try testing.expectEqualStrings(result[2], "foo bar baz");
+}
+
+test "execCommand: shell command owns fallback argument" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const command = try testing.allocator.dupeZ(u8, "foo bar baz");
+    defer testing.allocator.free(command);
+    const result = try execCommand(arena.allocator(), .{ .shell = command }, struct {
+        fn get(_: Allocator) !PasswdEntry {
+            return error.Fail;
+        }
+    });
+    @memset(command, 'x');
+
     try testing.expectEqualStrings(result[2], "foo bar baz");
 }
 
