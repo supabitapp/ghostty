@@ -238,16 +238,17 @@ fn startPosix(self: *Command, arena: Allocator) !void {
         }
 
         var path_expanded_buf: [std.fs.max_path_bytes]u8 = undefined;
-        var it = std.mem.tokenizeScalar(u8, path, ':');
+        var it = std.mem.splitScalar(u8, path, ':');
         var err: posix.system.E = .NOENT;
         var seen_eacces = false;
 
         while (it.next()) |search_path| {
-            const path_len = search_path.len + file_slice.len + 1;
+            const directory = if (search_path.len == 0) "." else search_path;
+            const path_len = directory.len + file_slice.len + 1;
             if (path_expanded_buf.len < path_len + 1) break :execve .NAMETOOLONG;
-            @memcpy(path_expanded_buf[0..search_path.len], search_path);
-            path_expanded_buf[search_path.len] = '/';
-            @memcpy(path_expanded_buf[search_path.len + 1 ..][0..file_slice.len], file_slice);
+            @memcpy(path_expanded_buf[0..directory.len], directory);
+            path_expanded_buf[directory.len] = '/';
+            @memcpy(path_expanded_buf[directory.len + 1 ..][0..file_slice.len], file_slice);
             path_expanded_buf[path_len] = 0;
             const full_path = path_expanded_buf[0..path_len :0].ptr;
             // Replace here, switch on error (any error means that replace
@@ -933,7 +934,7 @@ test "Command: custom env vars" {
     }
 }
 
-test "Command: custom PATH resolves executable" {
+test "Command: empty custom PATH component resolves executable from cwd" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     var td = try TempDir.init();
@@ -942,14 +943,17 @@ test "Command: custom PATH resolves executable" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try td.dir.realPath(testing.io, &path_buf)];
+    const cwd = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(cwd);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
-    try env.put("PATH", path);
+    try env.put("PATH", ":");
 
     var cmd: Command = .{
         .path = "ghostty-custom-path-command",
         .args = &.{ "ghostty-custom-path-command", "-c", "exit 0" },
         .env = &env,
+        .cwd = cwd,
         .os_pre_exec = null,
         .rt_pre_exec = null,
         .rt_post_fork = null,
