@@ -47,6 +47,11 @@ pub fn setup(
     env: *EnvMap,
     force_shell: ?Shell,
 ) !?ShellIntegration {
+    switch (command) {
+        .direct => return null,
+        .shell => {},
+    }
+
     const shell: Shell = force_shell orelse
         try detectShell(alloc_arena, command) orelse
         return null;
@@ -109,6 +114,45 @@ test "force shell" {
             shell,
         );
         try testing.expectEqual(shell, result.?.shell);
+    }
+}
+
+test "direct commands bypass shell integration" {
+    const testing = std.testing;
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const Case = struct {
+        shell: Shell,
+        executable: [:0]const u8,
+    };
+
+    inline for ([_]Case{
+        .{ .shell = .bash, .executable = "bash" },
+        .{ .shell = .elvish, .executable = "elvish" },
+        .{ .shell = .fish, .executable = "fish" },
+        .{ .shell = .nushell, .executable = "nu" },
+        .{ .shell = .zsh, .executable = "zsh" },
+    }) |case| {
+        var res: TmpResourcesDir = try .init(case.shell);
+        defer res.deinit();
+
+        inline for ([_]?Shell{ null, case.shell }) |force_shell| {
+            var env = EnvMap.init(alloc);
+            defer env.deinit();
+
+            const result = try setup(
+                alloc,
+                res.path,
+                .{ .direct = &.{ case.executable, "--no-startup" } },
+                &env,
+                force_shell,
+            );
+            try testing.expect(result == null);
+            try testing.expectEqual(0, env.count());
+        }
     }
 }
 
