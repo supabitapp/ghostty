@@ -493,7 +493,7 @@ pub const Surface = struct {
         if (command) |c_command| {
             const cmd = std.mem.sliceTo(c_command, 0);
             if (cmd.len > 0) {
-                config.command = .{ .shell = try config.arenaAlloc().dupe(u8, cmd) };
+                config.command = .{ .shell = try config.arenaAlloc().dupeSentinel(u8, cmd, 0) };
                 config.@"initial-command" = null;
             }
             return;
