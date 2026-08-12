@@ -447,6 +447,8 @@ pub const Surface = struct {
         /// This command always run in a shell (e.g. via `/bin/sh -c`),
         /// despite Ghostty allowing directly executed commands via config.
         command: ?[*:0]const u8 = null,
+        command_argv: ?[*]const ?[*:0]const u8 = null,
+        command_argv_count: usize = 0,
 
         /// Extra environment variables to set for the surface.
         env_vars: ?[*]EnvVar = null,
@@ -465,10 +467,54 @@ pub const Surface = struct {
         command_wrapper_count: usize = 0,
     };
 
-    fn applyCommand(config: *Config, command: ?[*:0]const u8) void {
-        const c_command = command orelse return;
-        const cmd = std.mem.sliceTo(c_command, 0);
-        if (cmd.len > 0) config.command = .{ .shell = cmd };
+    test "surface options match C layout" {
+        const testing = std.testing;
+        const COptions = @import("ghostty.h").ghostty_surface_config_s;
+        try testing.expectEqual(@sizeOf(COptions), @sizeOf(Options));
+        try testing.expectEqual(@alignOf(COptions), @alignOf(Options));
+        inline for (@typeInfo(Options).@"struct".fields) |field| {
+            try testing.expectEqual(
+                @offsetOf(COptions, field.name),
+                @offsetOf(Options, field.name),
+            );
+        }
+    }
+
+    fn applyCommand(
+        config: *Config,
+        command: ?[*:0]const u8,
+        command_argv: ?[*]const ?[*:0]const u8,
+        command_argv_count: usize,
+    ) !void {
+        if (command != null and (command_argv != null or command_argv_count != 0)) {
+            return error.ConflictingCommandOptions;
+        }
+
+        if (command) |c_command| {
+            const cmd = std.mem.sliceTo(c_command, 0);
+            if (cmd.len > 0) {
+                config.command = .{ .shell = cmd };
+                config.@"initial-command" = null;
+            }
+            return;
+        }
+
+        const source = command_argv orelse {
+            if (command_argv_count != 0) return error.CommandArgvMissing;
+            return;
+        };
+        if (command_argv_count == 0) return error.CommandArgvEmpty;
+
+        const alloc = config.arenaAlloc();
+        const argv = try alloc.alloc([:0]const u8, command_argv_count);
+        for (source[0..command_argv_count], argv, 0..) |c_arg, *arg, i| {
+            const source_arg = c_arg orelse return error.CommandArgvNull;
+            const value = std.mem.span(source_arg);
+            if (i == 0 and value.len == 0) return error.CommandExecutableEmpty;
+            arg.* = try alloc.dupeZ(u8, value);
+        }
+        config.command = .{ .direct = argv };
+        config.@"initial-command" = null;
     }
 
     test "surface command does not imply wait after command" {
@@ -477,10 +523,93 @@ pub const Surface = struct {
         defer config.deinit();
         const command = try config.arenaAlloc().dupeZ(u8, "echo ready");
 
-        applyCommand(&config, command.ptr);
+        try applyCommand(&config, command.ptr, null, 0);
 
         try testing.expect(config.command != null);
         try testing.expect(!config.@"wait-after-command");
+    }
+
+    test "surface command argv is exact and owned" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+
+        var executable = "codex".*;
+        var spaced = "argument with spaces".*;
+        var syntax = "$HOME;exit".*;
+        const source = [_]?[*:0]const u8{ &executable, "", &spaced, &syntax };
+
+        try applyCommand(&config, null, &source, source.len);
+        executable[0] = 'x';
+        spaced[0] = 'x';
+        syntax[0] = 'x';
+
+        const argv = config.command.?.direct;
+        try testing.expectEqual(4, argv.len);
+        try testing.expectEqualStrings("codex", argv[0]);
+        try testing.expectEqualStrings("", argv[1]);
+        try testing.expectEqualStrings("argument with spaces", argv[2]);
+        try testing.expectEqualStrings("$HOME;exit", argv[3]);
+    }
+
+    test "surface command options reject conflicts" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+        const source = [_]?[*:0]const u8{"codex"};
+
+        try testing.expectError(
+            error.ConflictingCommandOptions,
+            applyCommand(&config, "echo ready", &source, source.len),
+        );
+    }
+
+    test "surface host command overrides initial command" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+
+        config.@"initial-command" = .{ .shell = "configured" };
+        try applyCommand(&config, null, null, 0);
+        try testing.expect(config.@"initial-command" != null);
+        try applyCommand(&config, "", null, 0);
+        try testing.expect(config.@"initial-command" != null);
+
+        try applyCommand(&config, "host shell", null, 0);
+        try testing.expect(config.@"initial-command" == null);
+
+        config.@"initial-command" = .{ .shell = "configured" };
+        const source = [_]?[*:0]const u8{ "codex", "resume", "session" };
+        try applyCommand(&config, null, &source, source.len);
+        try testing.expect(config.@"initial-command" == null);
+    }
+
+    test "surface command argv rejects invalid values" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+
+        const source = [_]?[*:0]const u8{"codex"};
+        try testing.expectError(
+            error.CommandArgvMissing,
+            applyCommand(&config, null, null, 1),
+        );
+        try testing.expectError(
+            error.CommandArgvEmpty,
+            applyCommand(&config, null, &source, 0),
+        );
+
+        const null_arg = [_]?[*:0]const u8{ "codex", null };
+        try testing.expectError(
+            error.CommandArgvNull,
+            applyCommand(&config, null, &null_arg, null_arg.len),
+        );
+
+        const empty_executable = [_]?[*:0]const u8{""};
+        try testing.expectError(
+            error.CommandExecutableEmpty,
+            applyCommand(&config, null, &empty_executable, empty_executable.len),
+        );
     }
 
     fn freeInheritedOptions(alloc: Allocator, opts: *Options) void {
@@ -645,7 +774,12 @@ pub const Surface = struct {
             }
         }
 
-        applyCommand(&config, opts.command);
+        try applyCommand(
+            &config,
+            opts.command,
+            opts.command_argv,
+            opts.command_argv_count,
+        );
 
         // Apply any environment variables that were requested.
         if (opts.env_var_count > 0) {

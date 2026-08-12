@@ -1940,7 +1940,9 @@ fn execCommand(
             // Direct args can be passed directly to login, since
             // login uses execvp we don't need to worry about PATH
             // searching.
-            .direct => |v| try args.appendSlice(alloc, v),
+            .direct => |v| for (v) |arg| {
+                try args.append(alloc, try alloc.dupeZ(u8, arg));
+            },
 
             .shell => |v| {
                 // Use "exec" to replace the bash process with
@@ -2158,6 +2160,37 @@ test "execCommand darwin: direct command" {
     try testing.expectEqualStrings(result[2], "testuser");
     try testing.expectEqualStrings(result[3], "foo");
     try testing.expectEqualStrings(result[4], "bar baz");
+}
+
+test "execCommand darwin: direct command owns arguments" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var command_arena = ArenaAllocator.init(testing.allocator);
+    const command = try (configpkg.Command{ .direct = &.{
+        "foo",
+        "bar baz",
+        "",
+    } }).clone(command_arena.allocator());
+
+    const result = try execCommand(alloc, command, struct {
+        fn get(_: Allocator) !PasswdEntry {
+            return .{ .name = "testuser" };
+        }
+    });
+    command_arena.deinit();
+
+    try testing.expectEqual(6, result.len);
+    try testing.expectEqualStrings("/usr/bin/login", result[0]);
+    try testing.expectEqualStrings("-flp", result[1]);
+    try testing.expectEqualStrings("testuser", result[2]);
+    try testing.expectEqualStrings("foo", result[3]);
+    try testing.expectEqualStrings("bar baz", result[4]);
+    try testing.expectEqualStrings("", result[5]);
 }
 
 test "execCommand: shell command, empty passwd" {

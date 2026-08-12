@@ -472,6 +472,8 @@ typedef struct {
   float font_size;
   const char* working_directory;
   const char* command;
+  const char* const* command_argv;
+  size_t command_argv_count;
   ghostty_env_var_s* env_vars;
   size_t env_var_count;
   const char* initial_input;

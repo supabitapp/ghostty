@@ -187,6 +187,10 @@ fn startPosix(self: *Command, arena: Allocator) !void {
         std.c.environ
     else
         @compileError("missing env vars");
+    const path = if (self.env) |env_map|
+        env_map.get("PATH") orelse global.environ().getPosix("PATH") orelse "/usr/local/bin:/bin/:/usr/bin"
+    else
+        global.environ().getPosix("PATH") orelse "/usr/local/bin:/bin/:/usr/bin";
 
     // Fork.
     const pid = try fork();
@@ -234,8 +238,7 @@ fn startPosix(self: *Command, arena: Allocator) !void {
         }
 
         var path_expanded_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const PATH = global.environ().getPosix("PATH") orelse "/usr/local/bin:/bin/:/usr/bin";
-        var it = std.mem.tokenizeScalar(u8, PATH, ':');
+        var it = std.mem.tokenizeScalar(u8, path, ':');
         var err: posix.system.E = .NOENT;
         var seen_eacces = false;
 
@@ -928,6 +931,35 @@ test "Command: custom env vars" {
     } else {
         try testing.expectEqualStrings("hello\n", contents);
     }
+}
+
+test "Command: custom PATH resolves executable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var td = try TempDir.init();
+    defer td.deinit();
+    try td.dir.symLink(testing.io, "/bin/sh", "ghostty-custom-path-command", .{});
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try td.dir.realPath(testing.io, &path_buf)];
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", path);
+
+    var cmd: Command = .{
+        .path = "ghostty-custom-path-command",
+        .args = &.{ "ghostty-custom-path-command", "-c", "exit 0" },
+        .env = &env,
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+
+    try cmd.testingStart();
+    const exit = try cmd.wait(true);
+    try testing.expectEqual(@as(u8, 0), exit.Exited);
 }
 
 test "Command: custom working directory" {
