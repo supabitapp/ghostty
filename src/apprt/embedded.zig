@@ -493,7 +493,7 @@ pub const Surface = struct {
         if (command) |c_command| {
             const cmd = std.mem.sliceTo(c_command, 0);
             if (cmd.len > 0) {
-                config.command = .{ .shell = cmd };
+                config.command = .{ .shell = try config.arenaAlloc().dupe(u8, cmd) };
                 config.@"initial-command" = null;
             }
             return;
@@ -521,11 +521,13 @@ pub const Surface = struct {
         const testing = std.testing;
         var config = try Config.default(testing.allocator);
         defer config.deinit();
-        const command = try config.arenaAlloc().dupeZ(u8, "echo ready");
+        var command = "echo ready".*;
 
-        try applyCommand(&config, command.ptr, null, 0);
+        try applyCommand(&config, &command, null, 0);
+        command[0] = 'x';
 
         try testing.expect(config.command != null);
+        try testing.expectEqualStrings("echo ready", config.command.?.shell);
         try testing.expect(!config.@"wait-after-command");
     }
 
