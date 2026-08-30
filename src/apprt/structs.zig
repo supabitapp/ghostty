@@ -65,7 +65,7 @@ pub const ClipboardContent = struct {
     data: [:0]const u8,
 };
 
-pub const ClipboardRequestType = enum(u8) {
+pub const ClipboardRequestType = enum(c_int) {
     paste,
     osc_52_read,
     osc_52_write,

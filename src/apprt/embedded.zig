@@ -69,6 +69,7 @@ pub const App = struct {
             SurfaceUD,
             c_int,
             *apprt.ClipboardRequest,
+            apprt.ClipboardRequestType,
             [*]const [*:0]const u8,
             usize,
             bool,
@@ -93,11 +94,123 @@ pub const App = struct {
             [*]const CAPI.ClipboardContent,
             usize,
             bool,
-        ) callconv(.c) void,
+        ) callconv(.c) bool,
 
         /// Close the current surface given by this function.
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
     };
+
+    test "runtime options match C ABI" {
+        const testing = std.testing;
+        const C = @import("ghostty.h");
+        const COptions = C.ghostty_runtime_config_s;
+        const Class = enum { pointer, integer, boolean, void };
+        const ABI = struct {
+            fn callback(comptime T: type) type {
+                return switch (@typeInfo(T)) {
+                    .optional => |info| callback(info.child),
+                    .pointer => |info| info.child,
+                    else => @compileError("expected callback pointer"),
+                };
+            }
+
+            fn class(comptime T: type) Class {
+                return switch (@typeInfo(T)) {
+                    .optional => |info| class(info.child),
+                    .pointer => .pointer,
+                    .int, .@"enum" => .integer,
+                    .bool => .boolean,
+                    .void => .void,
+                    else => @compileError("unsupported ABI type"),
+                };
+            }
+
+            fn expectCallback(comptime Zig: type, comptime CCallback: type) !void {
+                const zig_info = @typeInfo(callback(Zig)).@"fn";
+                const c_info = @typeInfo(callback(CCallback)).@"fn";
+                try testing.expectEqual(zig_info.calling_convention, c_info.calling_convention);
+                try testing.expectEqual(zig_info.params.len, c_info.params.len);
+                inline for (zig_info.params, c_info.params) |zig_param, c_param| {
+                    const ZigParam = zig_param.type.?;
+                    const CParam = c_param.type.?;
+                    try testing.expectEqual(class(ZigParam), class(CParam));
+                    try testing.expectEqual(@sizeOf(ZigParam), @sizeOf(CParam));
+                    try testing.expectEqual(@alignOf(ZigParam), @alignOf(CParam));
+                }
+                const ZigReturn = zig_info.return_type.?;
+                const CReturn = c_info.return_type.?;
+                try testing.expectEqual(class(ZigReturn), class(CReturn));
+                try testing.expectEqual(@sizeOf(ZigReturn), @sizeOf(CReturn));
+                try testing.expectEqual(@alignOf(ZigReturn), @alignOf(CReturn));
+            }
+        };
+
+        try testing.expectEqual(@sizeOf(COptions), @sizeOf(Options));
+        try testing.expectEqual(@alignOf(COptions), @alignOf(Options));
+        try testing.expectEqual(@offsetOf(COptions, "userdata"), @offsetOf(Options, "userdata"));
+        try testing.expectEqual(
+            @offsetOf(COptions, "supports_selection_clipboard"),
+            @offsetOf(Options, "supports_selection_clipboard"),
+        );
+        try testing.expectEqual(@offsetOf(COptions, "wakeup_cb"), @offsetOf(Options, "wakeup"));
+        try testing.expectEqual(@offsetOf(COptions, "action_cb"), @offsetOf(Options, "action"));
+        try testing.expectEqual(
+            @offsetOf(COptions, "read_clipboard_cb"),
+            @offsetOf(Options, "read_clipboard"),
+        );
+        try testing.expectEqual(
+            @offsetOf(COptions, "confirm_read_clipboard_cb"),
+            @offsetOf(Options, "confirm_read_clipboard"),
+        );
+        try testing.expectEqual(
+            @offsetOf(COptions, "write_clipboard_cb"),
+            @offsetOf(Options, "write_clipboard"),
+        );
+        try testing.expectEqual(
+            @offsetOf(COptions, "close_surface_cb"),
+            @offsetOf(Options, "close_surface"),
+        );
+        try ABI.expectCallback(
+            @FieldType(Options, "read_clipboard"),
+            @FieldType(COptions, "read_clipboard_cb"),
+        );
+        try ABI.expectCallback(
+            @FieldType(Options, "write_clipboard"),
+            @FieldType(COptions, "write_clipboard_cb"),
+        );
+        try testing.expectEqual(
+            @sizeOf(C.ghostty_clipboard_request_e),
+            @sizeOf(apprt.ClipboardRequestType),
+        );
+        try testing.expectEqual(
+            @alignOf(C.ghostty_clipboard_request_e),
+            @alignOf(apprt.ClipboardRequestType),
+        );
+        try testing.expectEqual(
+            C.GHOSTTY_CLIPBOARD_REQUEST_PASTE,
+            @intFromEnum(apprt.ClipboardRequestType.paste),
+        );
+        try testing.expectEqual(
+            C.GHOSTTY_CLIPBOARD_REQUEST_OSC_52_READ,
+            @intFromEnum(apprt.ClipboardRequestType.osc_52_read),
+        );
+        try testing.expectEqual(
+            C.GHOSTTY_CLIPBOARD_REQUEST_OSC_52_WRITE,
+            @intFromEnum(apprt.ClipboardRequestType.osc_52_write),
+        );
+        try testing.expectEqual(
+            C.GHOSTTY_CLIPBOARD_REQUEST_KITTY_READ,
+            @intFromEnum(apprt.ClipboardRequestType.kitty_read),
+        );
+        try testing.expectEqual(
+            C.GHOSTTY_CLIPBOARD_REQUEST_KITTY_WRITE,
+            @intFromEnum(apprt.ClipboardRequestType.kitty_write),
+        );
+        try testing.expectEqual(
+            C.GHOSTTY_CLIPBOARD_REQUEST_LIST,
+            @intFromEnum(apprt.ClipboardRequestType.list),
+        );
+    }
 
     /// This is the key event sent for ghostty_surface_key and
     /// ghostty_app_key.
@@ -1078,6 +1191,7 @@ pub const Surface = struct {
             self.userdata,
             @intCast(@intFromEnum(clipboard_type)),
             state_ptr,
+            state_ptr.*,
             mimes.ptr,
             mimes.len,
             list,
@@ -1086,6 +1200,56 @@ pub const Surface = struct {
         // Only a started request completes later and keeps the state.
         if (result != .started) alloc.destroy(state_ptr);
         return result;
+    }
+
+    test "clipboard read callback receives request type" {
+        const testing = std.testing;
+        const Context = struct {
+            request: ?apprt.ClipboardRequestType = null,
+        };
+        const Callback = struct {
+            fn read(
+                userdata: ?*anyopaque,
+                _: c_int,
+                _: *apprt.ClipboardRequest,
+                request: apprt.ClipboardRequestType,
+                _: [*]const [*:0]const u8,
+                _: usize,
+                _: bool,
+            ) callconv(.c) apprt.ClipboardReadResult {
+                const context: *Context = @ptrCast(@alignCast(userdata.?));
+                context.request = request;
+                return .unavailable;
+            }
+        };
+
+        var core_app: CoreApp = undefined;
+        core_app.alloc = testing.allocator;
+        var app: App = undefined;
+        app.core_app = &core_app;
+        app.opts.read_clipboard = Callback.read;
+        var context: Context = .{};
+        var surface: Surface = undefined;
+        surface.app = &app;
+        surface.userdata = &context;
+        var kitty: apprt.ClipboardRequest.KittyRead = undefined;
+        kitty.mimes = &.{"image/png"};
+        kitty.list = false;
+
+        const requests = [_]apprt.ClipboardRequest{
+            .{ .paste = .standard },
+            .{ .osc_52_read = .standard },
+            .{ .kitty_read = &kitty },
+            .{ .list = .standard },
+        };
+        for (requests) |request| {
+            context.request = null;
+            try testing.expectEqual(
+                apprt.ClipboardReadResult.unavailable,
+                try surface.clipboardRequest(.standard, request),
+            );
+            try testing.expectEqual(std.meta.activeTag(request), context.request.?);
+        }
     }
 
     /// Complete a Kitty clipboard protocol write request. The apprt
@@ -1264,12 +1428,44 @@ pub const Surface = struct {
             };
         }
 
-        self.app.opts.write_clipboard(
+        if (!self.app.opts.write_clipboard(
             self.userdata,
             @intCast(@intFromEnum(clipboard_type)),
             array.ptr,
             array.len,
             confirm,
+        )) return error.ClipboardWriteFailed;
+    }
+
+    test "clipboard write callback failure returns an error" {
+        const testing = std.testing;
+        const Callback = struct {
+            fn write(
+                _: ?*anyopaque,
+                _: c_int,
+                _: [*]const CAPI.ClipboardContent,
+                _: usize,
+                _: bool,
+            ) callconv(.c) bool {
+                return false;
+            }
+        };
+
+        var core_app: CoreApp = undefined;
+        core_app.alloc = testing.allocator;
+        var app: App = undefined;
+        app.core_app = &core_app;
+        app.opts.write_clipboard = Callback.write;
+        var surface: Surface = undefined;
+        surface.app = &app;
+        surface.userdata = null;
+
+        try testing.expectError(
+            error.ClipboardWriteFailed,
+            surface.setClipboard(.standard, &.{.{
+                .mime = "text/plain",
+                .data = "value",
+            }}, false),
         );
     }
 

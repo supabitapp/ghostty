@@ -1069,6 +1069,7 @@ typedef ghostty_clipboard_read_result_e (*ghostty_runtime_read_clipboard_cb)(
     void*,
     ghostty_clipboard_e,
     void*,
+    ghostty_clipboard_request_e,
     const char* const*,
     size_t,
     bool);
@@ -1077,7 +1078,7 @@ typedef void (*ghostty_runtime_confirm_read_clipboard_cb)(
     const ghostty_clipboard_confirm_s*,
     void*,
     ghostty_clipboard_request_e);
-typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
+typedef bool (*ghostty_runtime_write_clipboard_cb)(void*,
                                                    ghostty_clipboard_e,
                                                    const ghostty_clipboard_content_s*,
                                                    size_t,
