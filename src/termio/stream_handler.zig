@@ -1427,7 +1427,15 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         cmd: Stream.Action.SemanticPrompt,
     ) !void {
+        if (semanticPromptSignalsShellReady(cmd)) {
+            self.surfaceMessageWriter(.shell_ready);
+        }
+
         switch (cmd.action) {
+            .end_prompt_start_input,
+            .end_prompt_start_input_terminate_eol,
+            => {},
+
             .end_input_start_output => {
                 self.surfaceMessageWriter(.start_command);
             },
@@ -1445,8 +1453,6 @@ pub const StreamHandler = struct {
             },
 
             // Handled by Terminal, no special handling by us
-            .end_prompt_start_input,
-            .end_prompt_start_input_terminate_eol,
             .fresh_line,
             .fresh_line_new_prompt,
             .new_command,
@@ -1893,6 +1899,31 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+fn semanticPromptSignalsShellReady(cmd: terminal.StreamAction.SemanticPrompt) bool {
+    return switch (cmd.action) {
+        .end_prompt_start_input,
+        .end_prompt_start_input_terminate_eol,
+        => true,
+
+        else => false,
+    };
+}
+
+test "OSC 133 B and I signal shell ready" {
+    const testing = std.testing;
+    const inputs = [_][]const u8{ "133;B", "133;I" };
+
+    for (inputs) |input| {
+        var parser: terminal.osc.Parser = .init(null);
+        defer parser.deinit();
+        parser.nextSlice(input);
+
+        const command = parser.end(null).?.*;
+        try testing.expect(command == .semantic_prompt);
+        try testing.expect(semanticPromptSignalsShellReady(command.semantic_prompt));
+    }
+}
 
 test "kitty clipboard read: targets-only never consumes a one-time grant" {
     const testing = std.testing;

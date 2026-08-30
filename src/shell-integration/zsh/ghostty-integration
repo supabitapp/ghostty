@@ -275,8 +275,9 @@ _ghostty_deferred_init() {
     (( $+functions[_ghostty_zle_line_init] )) || _ghostty_zle_line_init() { builtin true; }
     functions[_ghostty_zle_line_init]="
         if [[ \$PS1 != *$'%{\\e]133;A'* ]]; then
-            builtin print -nu \$_ghostty_fd '\\e]133;P;k=i\\a\\e]133;B\\a'
+            builtin print -nu \$_ghostty_fd '\\e]133;P;k=i\\a'
         fi
+        builtin print -nu \$_ghostty_fd '\\e]133;B\\a'
     "${functions[_ghostty_zle_line_init]}
 
     # Add Ghostty binary to PATH if the path feature is enabled
@@ -312,9 +313,11 @@ _ghostty_deferred_init() {
 
     # SSH Integration
     #
-    # Wrap `ssh` with `ghostty +ssh` and translate the shell-integration
-    # feature flags into command options.
-    if [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-* ]]; then
+    if [[ -x "${SUPATERM_CLI_PATH:-}" && ! -x "${GHOSTTY_BIN_DIR:-}/ghostty" ]]; then
+      function ssh() {
+        "$SUPATERM_CLI_PATH" ssh -- "$@"
+      }
+    elif [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-* ]]; then
       function ssh() {
         local flags=()
         [[ "$GHOSTTY_SHELL_FEATURES" != *ssh-env* ]] && flags+=(--forward-env=false)

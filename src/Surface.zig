@@ -200,6 +200,10 @@ pub const InputEffect = enum {
     closed,
 };
 
+pub const ProcessConfig = struct {
+    command_wrapper: []const [*:0]const u8 = &.{},
+};
+
 /// The search state for the surface.
 const Search = struct {
     state: terminal.search.Thread,
@@ -468,6 +472,7 @@ pub fn init(
     self: *Surface,
     alloc: Allocator,
     config_original: *const configpkg.Config,
+    process_config: ProcessConfig,
     app: *App,
     rt_app: *apprt.runtime.App,
     rt_surface: *apprt.runtime.Surface,
@@ -658,6 +663,7 @@ pub fn init(
         // Initialize our IO backend
         var io_exec = try termio.Exec.init(alloc, .{
             .command = command,
+            .command_wrapper = process_config.command_wrapper,
             .env = env,
             .env_override = config.env,
             .shell_integration = config.@"shell-integration",
@@ -1145,6 +1151,16 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .start_command => {
             self.command_timer = .now(global.io(), .awake);
+        },
+
+        .shell_ready => {
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .shell_ready,
+                {},
+            ) catch |err| {
+                log.warn("apprt failed to notify shell readiness={}", .{err});
+            };
         },
 
         .stop_command => |v| timer: {
@@ -1940,6 +1956,18 @@ pub fn dumpText(
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     return try self.dumpTextLocked(alloc, sel);
+}
+
+pub fn dumpTextTail(
+    self: *Surface,
+    alloc: Allocator,
+    count: usize,
+) Allocator.Error!Text {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return .{
+        .text = try self.io.terminal.screens.active.lastLinesString(alloc, count),
+    };
 }
 
 /// Same as `dumpText` but assumes the renderer state mutex is already

@@ -453,6 +453,7 @@ pub const Surface = struct {
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
+    command_wrapper: ?CommandWrapper = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -477,15 +478,13 @@ pub const Surface = struct {
         /// The working directory to load into.
         working_directory: ?[*:0]const u8 = null,
 
-        /// The command to run in the new surface. If this is set then
-        /// the "wait-after-command" option is also automatically set to true,
-        /// since this is used for scripting.
+        /// The command to run in the new surface.
         ///
         /// This command always run in a shell (e.g. via `/bin/sh -c`),
         /// despite Ghostty allowing directly executed commands via config.
-        /// This is a legacy thing and we should probably change it in the
-        /// future once we have a concrete use case.
         command: ?[*:0]const u8 = null,
+        command_argv: ?[*]const ?[*:0]const u8 = null,
+        command_argv_count: usize = 0,
 
         /// Extra environment variables to set for the surface.
         env_vars: ?[*]EnvVar = null,
@@ -499,9 +498,296 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        command_wrapper: ?[*]const [*:0]const u8 = null,
+        command_wrapper_count: usize = 0,
     };
 
+    test "surface options match C layout" {
+        const testing = std.testing;
+        const COptions = @import("ghostty.h").ghostty_surface_config_s;
+        try testing.expectEqual(@sizeOf(COptions), @sizeOf(Options));
+        try testing.expectEqual(@alignOf(COptions), @alignOf(Options));
+        inline for (@typeInfo(Options).@"struct".fields) |field| {
+            try testing.expectEqual(
+                @offsetOf(COptions, field.name),
+                @offsetOf(Options, field.name),
+            );
+        }
+    }
+
+    fn applyCommand(
+        config: *Config,
+        command: ?[*:0]const u8,
+        command_argv: ?[*]const ?[*:0]const u8,
+        command_argv_count: usize,
+    ) !void {
+        if (command != null and (command_argv != null or command_argv_count != 0)) {
+            return error.ConflictingCommandOptions;
+        }
+
+        if (command) |c_command| {
+            const cmd = std.mem.sliceTo(c_command, 0);
+            if (cmd.len > 0) {
+                config.command = .{ .shell = try config.arenaAlloc().dupeSentinel(u8, cmd, 0) };
+                config.@"initial-command" = null;
+            }
+            return;
+        }
+
+        const source = command_argv orelse {
+            if (command_argv_count != 0) return error.CommandArgvMissing;
+            return;
+        };
+        if (command_argv_count == 0) return error.CommandArgvEmpty;
+
+        const alloc = config.arenaAlloc();
+        const argv = try alloc.alloc([:0]const u8, command_argv_count);
+        for (source[0..command_argv_count], argv, 0..) |c_arg, *arg, i| {
+            const source_arg = c_arg orelse return error.CommandArgvNull;
+            const value = std.mem.span(source_arg);
+            if (i == 0 and value.len == 0) return error.CommandExecutableEmpty;
+            arg.* = try alloc.dupeZ(u8, value);
+        }
+        config.command = .{ .direct = argv };
+        config.@"initial-command" = null;
+    }
+
+    test "surface command does not imply wait after command" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+        var command = "echo ready".*;
+
+        try applyCommand(&config, &command, null, 0);
+        command[0] = 'x';
+
+        try testing.expect(config.command != null);
+        try testing.expectEqualStrings("echo ready", config.command.?.shell);
+        try testing.expect(!config.@"wait-after-command");
+    }
+
+    test "surface command argv is exact and owned" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+
+        var executable = "codex".*;
+        var spaced = "argument with spaces".*;
+        var syntax = "$HOME;exit".*;
+        const source = [_]?[*:0]const u8{ &executable, "", &spaced, &syntax };
+
+        try applyCommand(&config, null, &source, source.len);
+        executable[0] = 'x';
+        spaced[0] = 'x';
+        syntax[0] = 'x';
+
+        const argv = config.command.?.direct;
+        try testing.expectEqual(4, argv.len);
+        try testing.expectEqualStrings("codex", argv[0]);
+        try testing.expectEqualStrings("", argv[1]);
+        try testing.expectEqualStrings("argument with spaces", argv[2]);
+        try testing.expectEqualStrings("$HOME;exit", argv[3]);
+    }
+
+    test "surface command options reject conflicts" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+        const source = [_]?[*:0]const u8{"codex"};
+
+        try testing.expectError(
+            error.ConflictingCommandOptions,
+            applyCommand(&config, "echo ready", &source, source.len),
+        );
+    }
+
+    test "surface host command overrides initial command" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+
+        config.@"initial-command" = .{ .shell = "configured" };
+        try applyCommand(&config, null, null, 0);
+        try testing.expect(config.@"initial-command" != null);
+        try applyCommand(&config, "", null, 0);
+        try testing.expect(config.@"initial-command" != null);
+
+        try applyCommand(&config, "host shell", null, 0);
+        try testing.expect(config.@"initial-command" == null);
+
+        config.@"initial-command" = .{ .shell = "configured" };
+        const source = [_]?[*:0]const u8{ "codex", "resume", "session" };
+        try applyCommand(&config, null, &source, source.len);
+        try testing.expect(config.@"initial-command" == null);
+    }
+
+    test "surface command argv rejects invalid values" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+
+        const source = [_]?[*:0]const u8{"codex"};
+        try testing.expectError(
+            error.CommandArgvMissing,
+            applyCommand(&config, null, null, 1),
+        );
+        try testing.expectError(
+            error.CommandArgvEmpty,
+            applyCommand(&config, null, &source, 0),
+        );
+
+        const null_arg = [_]?[*:0]const u8{ "codex", null };
+        try testing.expectError(
+            error.CommandArgvNull,
+            applyCommand(&config, null, &null_arg, null_arg.len),
+        );
+
+        const empty_executable = [_]?[*:0]const u8{""};
+        try testing.expectError(
+            error.CommandExecutableEmpty,
+            applyCommand(&config, null, &empty_executable, empty_executable.len),
+        );
+    }
+
+    fn freeInheritedOptions(alloc: Allocator, opts: *Options) void {
+        if (opts.working_directory) |working_directory| {
+            alloc.free(std.mem.span(working_directory));
+            opts.working_directory = null;
+        }
+    }
+
+    test "inherited options free owned working directory" {
+        const testing = std.testing;
+        var opts: Options = .{
+            .working_directory = (try testing.allocator.dupeZ(u8, "/tmp")).ptr,
+        };
+
+        freeInheritedOptions(testing.allocator, &opts);
+
+        try testing.expect(opts.working_directory == null);
+    }
+
+    const CommandWrapper = struct {
+        args: []const [*:0]const u8,
+
+        fn init(
+            alloc: Allocator,
+            source: ?[*]const [*:0]const u8,
+            count: usize,
+        ) Allocator.Error!?CommandWrapper {
+            const source_args = source orelse return null;
+            if (count == 0) return null;
+
+            const args = try alloc.alloc([*:0]const u8, count);
+            errdefer alloc.free(args);
+
+            var initialized: usize = 0;
+            errdefer for (args[0..initialized]) |arg| alloc.free(std.mem.span(arg));
+
+            for (source_args[0..count], args) |source_arg, *arg| {
+                arg.* = (try alloc.dupeZ(u8, std.mem.span(source_arg))).ptr;
+                initialized += 1;
+            }
+
+            return .{ .args = args };
+        }
+
+        fn deinit(self: CommandWrapper, alloc: Allocator) void {
+            for (self.args) |arg| alloc.free(std.mem.span(arg));
+            alloc.free(self.args);
+        }
+
+        fn inherit(self: CommandWrapper, opts: *Options) void {
+            opts.command_wrapper = self.args.ptr;
+            opts.command_wrapper_count = self.args.len;
+        }
+    };
+
+    test "Surface command wrapper owns and inherits Zmx argv shapes" {
+        const testing = std.testing;
+        var create_executable = "/tmp/zmx".*;
+        var existing_executable = "/tmp/zmx".*;
+        const create_source = [_][*:0]const u8{
+            &create_executable,
+            "attach",
+            "123e4567-e89b-12d3-a456-426614174000",
+        };
+        const existing_source = [_][*:0]const u8{
+            &existing_executable,
+            "attach",
+            "--existing",
+            "123e4567-e89b-12d3-a456-426614174000",
+        };
+        const create_expected = [_][]const u8{
+            "/tmp/zmx",
+            "attach",
+            "123e4567-e89b-12d3-a456-426614174000",
+        };
+        const existing_expected = [_][]const u8{
+            "/tmp/zmx",
+            "attach",
+            "--existing",
+            "123e4567-e89b-12d3-a456-426614174000",
+        };
+        const cases = [_]struct {
+            source: []const [*:0]const u8,
+            expected: []const []const u8,
+            executable: []u8,
+        }{
+            .{
+                .source = &create_source,
+                .expected = &create_expected,
+                .executable = &create_executable,
+            },
+            .{
+                .source = &existing_source,
+                .expected = &existing_expected,
+                .executable = &existing_executable,
+            },
+        };
+
+        for (cases) |case| {
+            const parent = (try CommandWrapper.init(
+                testing.allocator,
+                case.source.ptr,
+                case.source.len,
+            )).?;
+            defer parent.deinit(testing.allocator);
+
+            case.executable[5] = 'X';
+            try testing.expectEqualStrings(case.expected[0], std.mem.span(parent.args[0]));
+
+            var inherited: Options = .{};
+            parent.inherit(&inherited);
+            try testing.expectEqual(
+                @intFromPtr(parent.args.ptr),
+                @intFromPtr(inherited.command_wrapper.?),
+            );
+
+            const child = (try CommandWrapper.init(
+                testing.allocator,
+                inherited.command_wrapper,
+                inherited.command_wrapper_count,
+            )).?;
+            defer child.deinit(testing.allocator);
+
+            try testing.expectEqual(case.expected.len, child.args.len);
+            for (case.expected, child.args) |expected, actual| {
+                try testing.expectEqualStrings(expected, std.mem.span(actual));
+            }
+        }
+    }
+
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
+        const surface_alloc = app.core_app.alloc;
+        const command_wrapper = try CommandWrapper.init(
+            surface_alloc,
+            opts.command_wrapper,
+            opts.command_wrapper_count,
+        );
+        errdefer if (command_wrapper) |wrapper| wrapper.deinit(surface_alloc);
+
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
@@ -513,6 +799,7 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .command_wrapper = command_wrapper,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -564,14 +851,12 @@ pub const Surface = struct {
             }
         }
 
-        // If we have a command from the options then we set it.
-        if (opts.command) |c_command| {
-            const cmd = std.mem.sliceTo(c_command, 0);
-            if (cmd.len > 0) {
-                config.command = .{ .shell = cmd };
-                config.@"wait-after-command" = true;
-            }
-        }
+        try applyCommand(
+            &config,
+            opts.command,
+            opts.command_argv,
+            opts.command_argv_count,
+        );
 
         // Apply any environment variables that were requested.
         if (opts.env_var_count > 0) {
@@ -615,8 +900,9 @@ pub const Surface = struct {
         // Initialize our surface right away. We're given a view that is
         // ready to use.
         try self.core_surface.init(
-            app.core_app.alloc,
+            surface_alloc,
             &config,
+            .{ .command_wrapper = if (command_wrapper) |wrapper| wrapper.args else &.{} },
             app.core_app,
             app,
             self,
@@ -643,6 +929,8 @@ pub const Surface = struct {
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
+
+        if (self.command_wrapper) |wrapper| wrapper.deinit(self.app.core_app.alloc);
     }
 
     /// Initialize the inspector instance. A surface can only have one
@@ -881,7 +1169,7 @@ pub const Surface = struct {
             raw_contents.len,
         ) catch |err| {
             log.err("error completing clipboard request err={}", .{err});
-            alloc.destroy(state);
+            self.denyClipboardRequest(state);
             return;
         };
         defer conv_alloc.free(contents);
@@ -897,7 +1185,7 @@ pub const Surface = struct {
             raw_available.len,
         ) catch |err| {
             log.err("error completing clipboard request err={}", .{err});
-            alloc.destroy(state);
+            self.denyClipboardRequest(state);
             return;
         };
         defer conv_alloc.free(available);
@@ -1171,11 +1459,13 @@ pub const Surface = struct {
             break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
         };
 
-        return .{
+        var opts: apprt.Surface.Options = .{
             .font_size = font_size,
             .working_directory = working_directory,
             .context = context,
         };
+        if (self.command_wrapper) |wrapper| wrapper.inherit(&opts);
+        return opts;
     }
 
     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
@@ -1838,6 +2128,13 @@ pub const CAPI = struct {
         return surface.newSurfaceOptions(source);
     }
 
+    export fn ghostty_surface_inherited_config_free(
+        surface: *Surface,
+        opts: *Surface.Options,
+    ) void {
+        Surface.freeInheritedOptions(surface.app.core_app.alloc, opts);
+    }
+
     /// Update the configuration to the provided config for only this surface.
     export fn ghostty_surface_update_config(
         surface: *Surface,
@@ -1901,6 +2198,47 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
+    export fn ghostty_surface_read_text_suffix(
+        surface: *Surface,
+        sel: Selection,
+        maximum_bytes: usize,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+
+        const core_sel = sel.core(
+            core_surface.renderer_state.terminal.screens.active,
+        ) orelse return false;
+        const text = core_surface.io.terminal.screens.active.selectionStringSuffix(
+            global.alloc(),
+            core_sel,
+            maximum_bytes,
+        ) catch |err| {
+            log.warn("error reading text suffix err={}", .{err});
+            return false;
+        };
+        takeTextResult(result, .{ .text = text });
+        return true;
+    }
+
+    export fn ghostty_surface_read_text_tail(
+        surface: *Surface,
+        lines: u32,
+        result: *Text,
+    ) bool {
+        const text = surface.core_surface.dumpTextTail(
+            global.alloc(),
+            @intCast(lines),
+        ) catch |err| {
+            log.warn("error reading text tail err={}", .{err});
+            return false;
+        };
+        takeTextResult(result, text);
+        return true;
+    }
+
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
@@ -1917,7 +2255,12 @@ pub const CAPI = struct {
             return false;
         };
 
-        const vp: CoreSurface.Text.Viewport = text.viewport orelse .{
+        takeTextResult(result, text);
+        return true;
+    }
+
+    fn takeTextResult(result: *Text, text: CoreSurface.Text) void {
+        const viewport: CoreSurface.Text.Viewport = text.viewport orelse .{
             .tl_px_x = -1,
             .tl_px_y = -1,
             .offset_start = 0,
@@ -1925,15 +2268,13 @@ pub const CAPI = struct {
         };
 
         result.* = .{
-            .tl_px_x = vp.tl_px_x,
-            .tl_px_y = vp.tl_px_y,
-            .offset_start = vp.offset_start,
-            .offset_len = vp.offset_len,
+            .tl_px_x = viewport.tl_px_x,
+            .tl_px_y = viewport.tl_px_y,
+            .offset_start = viewport.offset_start,
+            .offset_len = viewport.offset_len,
             .text = text.text.ptr,
             .text_len = text.text.len,
         };
-
-        return true;
     }
 
     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {

@@ -17,6 +17,7 @@ const PageList = @import("PageList.zig");
 const selection_codepoints = @import("selection_codepoints.zig");
 const StringMap = @import("StringMap.zig");
 const ScreenFormatter = @import("formatter.zig").ScreenFormatter;
+const PageListFormatter = @import("formatter.zig").PageListFormatter;
 const PinMap = @import("formatter.zig").PinMap;
 const osc = @import("osc.zig");
 const pagepkg = @import("page.zig");
@@ -2929,6 +2930,147 @@ pub const SelectionString = struct {
     trim: bool = true,
 };
 
+const SuffixWriter = struct {
+    writer: std.Io.Writer,
+    storage: []u8,
+    start: usize = 0,
+    len: usize = 0,
+
+    fn init(storage: []u8) SuffixWriter {
+        return .{
+            .writer = .{
+                .buffer = &.{},
+                .vtable = &.{ .drain = drain },
+            },
+            .storage = storage,
+        };
+    }
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *SuffixWriter = @fieldParentPtr("writer", writer);
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.append(bytes);
+            written += bytes.len;
+        }
+        for (0..splat) |_| {
+            const bytes = data[data.len - 1];
+            self.append(bytes);
+            written += bytes.len;
+        }
+        return written;
+    }
+
+    fn append(self: *SuffixWriter, bytes: []const u8) void {
+        const capacity = self.storage.len;
+        if (capacity == 0 or bytes.len == 0) return;
+        if (bytes.len >= capacity) {
+            @memcpy(self.storage, bytes[bytes.len - capacity ..]);
+            self.start = 0;
+            self.len = capacity;
+            return;
+        }
+
+        const available = capacity - self.len;
+        const initial_len = @min(available, bytes.len);
+        @memcpy(
+            self.storage[self.len..][0..initial_len],
+            bytes[0..initial_len],
+        );
+        self.len += initial_len;
+        if (initial_len == bytes.len) return;
+
+        const remaining = bytes[initial_len..];
+        const first_len = @min(remaining.len, capacity - self.start);
+        @memcpy(
+            self.storage[self.start..][0..first_len],
+            remaining[0..first_len],
+        );
+        @memcpy(
+            self.storage[0 .. remaining.len - first_len],
+            remaining[first_len..],
+        );
+        self.start = (self.start + remaining.len) % capacity;
+    }
+
+    fn finish(self: *SuffixWriter) []u8 {
+        if (self.start > 0) {
+            std.mem.rotate(u8, self.storage[0..self.len], self.start);
+        }
+        return self.storage[0..self.len];
+    }
+};
+
+const UTF8SuffixStartWriter = struct {
+    writer: std.Io.Writer,
+    candidate: usize,
+    offset: usize = 0,
+    start: ?usize = null,
+
+    fn init(candidate: usize) UTF8SuffixStartWriter {
+        return .{
+            .writer = .{
+                .buffer = &.{},
+                .vtable = &.{ .drain = drain },
+            },
+            .candidate = candidate,
+        };
+    }
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *UTF8SuffixStartWriter = @fieldParentPtr("writer", writer);
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.scan(bytes);
+            written += bytes.len;
+        }
+        for (0..splat) |_| {
+            const bytes = data[data.len - 1];
+            self.scan(bytes);
+            written += bytes.len;
+        }
+        return written;
+    }
+
+    fn scan(self: *UTF8SuffixStartWriter, bytes: []const u8) void {
+        if (self.start == null and self.offset + bytes.len > self.candidate) {
+            const first = self.candidate -| self.offset;
+            for (bytes[first..], first..) |byte, index| {
+                if (byte & 0xC0 != 0x80) {
+                    self.start = self.offset + index;
+                    break;
+                }
+            }
+        }
+        self.offset += bytes.len;
+    }
+};
+
+fn selectionFormatter(
+    self: *Screen,
+    sel: Selection,
+    trim: bool,
+) ScreenFormatter {
+    var formatter: ScreenFormatter = .init(
+        self,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = trim,
+        },
+    );
+    formatter.content = .{ .selection = sel };
+    return formatter;
+}
+
 /// Returns the raw text associated with a selection. This will unwrap
 /// soft-wrapped edges. The returned slice is owned by the caller and allocated
 /// using alloc, not the allocator associated with the screen (unless they match).
@@ -2970,15 +3112,7 @@ fn selectionStringImpl(
     defer aw.deinit();
 
     // Create a formatter and use that to emit our text.
-    var formatter: ScreenFormatter = .init(
-        self,
-        .{
-            .emit = .plain,
-            .unwrap = true,
-            .trim = opts.trim,
-        },
-    );
-    formatter.content = .{ .selection = opts.sel };
+    var formatter = self.selectionFormatter(opts.sel, opts.trim);
 
     if (pins) |map| formatter.pin_map = .{
         .alloc = alloc,
@@ -2989,6 +3123,42 @@ fn selectionStringImpl(
     // just becomes an OOM.
     formatter.format(&aw.writer) catch return error.OutOfMemory;
     return try aw.toOwnedSliceSentinel(0);
+}
+
+pub fn selectionStringSuffix(
+    self: *Screen,
+    alloc: Allocator,
+    sel: Selection,
+    maximum_bytes: usize,
+) Allocator.Error![:0]const u8 {
+    var discarding: std.Io.Writer.Discarding = .init(&.{});
+    var formatter = self.selectionFormatter(sel, false);
+    formatter.format(&discarding.writer) catch unreachable;
+
+    const total_len = std.math.cast(usize, discarding.fullCount()) orelse
+        return error.OutOfMemory;
+    const candidate = total_len - @min(total_len, maximum_bytes);
+    const suffix_start: usize = if (candidate == 0 or candidate == total_len)
+        candidate
+    else suffix_start: {
+        var boundary: UTF8SuffixStartWriter = .init(candidate);
+        formatter = self.selectionFormatter(sel, false);
+        formatter.format(&boundary.writer) catch unreachable;
+        break :suffix_start boundary.start orelse total_len;
+    };
+    const payload_len = total_len - suffix_start;
+    const allocation_len = std.math.add(usize, payload_len, 1) catch
+        return error.OutOfMemory;
+    const allocation = try alloc.alloc(u8, allocation_len);
+    errdefer alloc.free(allocation);
+
+    var suffix: SuffixWriter = .init(allocation[0..payload_len]);
+    formatter = self.selectionFormatter(sel, false);
+    formatter.format(&suffix.writer) catch unreachable;
+    const text = suffix.finish();
+    assert(text.len == payload_len);
+    allocation[text.len] = 0;
+    return allocation[0..text.len :0];
 }
 
 pub const SelectLine = struct {
@@ -3658,6 +3828,92 @@ pub fn dumpString(
 
     // Emit
     try formatter.format(writer);
+}
+
+const LastLines = struct {
+    top_left: Pin,
+    bottom_right: Pin,
+    trailing_blank_lines: usize,
+};
+
+fn lastLines(self: *const Screen, count: usize) ?LastLines {
+    if (count == 0) return null;
+
+    const active_top = self.pages.getTopLeft(.active);
+    const active_bottom = self.pages.getBottomRight(.active) orelse return null;
+    var active_rows = active_bottom.rowIterator(.left_up, active_top);
+    var last_active_text: ?Pin = null;
+    while (active_rows.next()) |pin| {
+        if (!Cell.hasTextAny(pin.cells(.all))) continue;
+        last_active_text = pin;
+        break;
+    }
+
+    const cursor = self.cursor.page_pin.*;
+    var end = cursor;
+    if (last_active_text) |pin| {
+        if (cursor.before(pin)) end = pin;
+    }
+    if (!Cell.hasTextAny(end.cells(.all))) {
+        end = end.up(1) orelse return null;
+    }
+    end.x = end.node.cols() - 1;
+
+    var rows = end.rowIterator(.left_up, null);
+    var start: ?Pin = null;
+    var remaining = count;
+    var trailing_blank_lines: usize = 0;
+    var trailing = true;
+
+    while (rows.next()) |pin| {
+        const row = pin.rowAndCell().row;
+        if (trailing) {
+            if (Cell.hasTextAny(pin.node.page().getCells(row))) {
+                trailing = false;
+            } else if (!row.wrap_continuation) {
+                trailing_blank_lines += 1;
+            }
+        }
+
+        var line_start = pin;
+        line_start.x = 0;
+        start = line_start;
+
+        if (!row.wrap_continuation) {
+            remaining -= 1;
+            if (remaining == 0) break;
+        }
+    }
+
+    return .{
+        .top_left = start orelse return null,
+        .bottom_right = end,
+        .trailing_blank_lines = trailing_blank_lines,
+    };
+}
+
+pub fn lastLinesString(
+    self: *const Screen,
+    alloc: Allocator,
+    count: usize,
+) Allocator.Error![:0]const u8 {
+    const last_lines = self.lastLines(count) orelse return alloc.dupeZ(u8, "");
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+
+    var formatter: PageListFormatter = .init(&self.pages, .{
+        .emit = .plain,
+        .unwrap = true,
+        .trim = false,
+    });
+    formatter.top_left = last_lines.top_left;
+    formatter.bottom_right = last_lines.bottom_right;
+    formatter.format(&output.writer) catch return error.OutOfMemory;
+
+    const newline_count = last_lines.trailing_blank_lines -|
+        @intFromBool(output.writer.buffered().len == 0);
+    output.writer.splatByteAll('\n', newline_count) catch return error.OutOfMemory;
+    return try output.toOwnedSliceSentinel(0);
 }
 
 /// You should use dumpString, this is a restricted version mostly for
@@ -9496,6 +9752,137 @@ test "Screen: selectLine with scrollback" {
     }
 }
 
+fn expectLastLines(
+    s: *Screen,
+    count: usize,
+    expected: []const u8,
+) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const text = try s.lastLinesString(alloc, count);
+    defer alloc.free(text);
+    try testing.expectEqualStrings(expected, text);
+}
+
+test "Screen: lastLines spans pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(testing.io, alloc, .{
+        .cols = 4,
+        .rows = 2,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+
+    const first_page = s.pages.pages.first.?;
+    first_page.page().pauseIntegrityChecks(true);
+    for (0..first_page.capacity().rows - 1) |_| try s.testWriteString("\n");
+    first_page.page().pauseIntegrityChecks(false);
+    try s.testWriteString("A\nB\nC\n");
+
+    const last_lines = s.lastLines(3).?;
+    try testing.expect(last_lines.top_left.node != last_lines.bottom_right.node);
+    try expectLastLines(&s, 3, "A\nB\nC");
+}
+
+test "Screen: lastLines preserves soft wraps" {
+    const testing = std.testing;
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 5,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+    try s.testWriteString("old\nabcdefghijk\nlast");
+
+    const last_lines = s.lastLines(2).?;
+    const start = last_lines.top_left;
+    try testing.expect(!start.rowAndCell().row.wrap_continuation);
+    try testing.expect(start.down(1).?.rowAndCell().row.wrap_continuation);
+    try expectLastLines(&s, 2, "abcdefghijk\nlast");
+}
+
+test "Screen: lastLines ignores a trailing empty row" {
+    const testing = std.testing;
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 5,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+    try s.testWriteString("one\ntwo\n");
+
+    try expectLastLines(&s, 1, "two");
+}
+
+test "Screen: lastLines preserves a trailing blank line" {
+    const testing = std.testing;
+
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 5,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+    try s.testWriteString("one\ntwo\n\n");
+
+    try expectLastLines(&s, 1, "");
+    try expectLastLines(&s, 2, "two\n");
+    try expectLastLines(&s, 3, "one\ntwo\n");
+}
+
+test "Screen: lastLines preserves repeated trailing blank lines" {
+    const testing = std.testing;
+
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 6,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+    try s.testWriteString("one\ntwo\n\n\n");
+
+    try expectLastLines(&s, 1, "");
+    try expectLastLines(&s, 2, "\n");
+    try expectLastLines(&s, 3, "two\n\n");
+}
+
+test "Screen: lastLines caps at available lines" {
+    const testing = std.testing;
+
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+    try s.testWriteString("one\ntwo\nthree");
+
+    try testing.expect(s.lastLines(0) == null);
+    try expectLastLines(&s, 1, "three");
+    try expectLastLines(&s, 2, "two\nthree");
+    try expectLastLines(&s, 3, "one\ntwo\nthree");
+    try expectLastLines(&s, 100, "one\ntwo\nthree");
+}
+
+test "Screen: lastLinesString reads empty and reset screens" {
+    const testing = std.testing;
+
+    var s = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback_bytes = 10000,
+    });
+    defer s.deinit();
+
+    try expectLastLines(&s, 1, "");
+    try s.testWriteString("one\ntwo");
+    s.reset();
+    try expectLastLines(&s, 1, "");
+    try expectLastLines(&s, 100, "");
+}
+
 // https://github.com/mitchellh/ghostty/issues/1329
 test "Screen: selectLine semantic prompt boundary" {
     const testing = std.testing;
@@ -10597,6 +10984,67 @@ test "Screen: selectionString soft wrap" {
         const expected = "2EFGH3IJ";
         try testing.expectEqualStrings(expected, contents);
     }
+}
+
+test "Screen: selectionStringSuffix byte caps and UTF-8" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 12, .rows = 1, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("prefix-🙂Z");
+
+    const sel = Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 9, .y = 0 } }).?,
+        false,
+    );
+    const cases = [_]struct {
+        maximum_bytes: usize,
+        expected: []const u8,
+    }{
+        .{ .maximum_bytes = 12, .expected = "prefix-🙂Z" },
+        .{ .maximum_bytes = 5, .expected = "🙂Z" },
+        .{ .maximum_bytes = 4, .expected = "Z" },
+        .{ .maximum_bytes = 1, .expected = "Z" },
+        .{ .maximum_bytes = 0, .expected = "" },
+    };
+    for (cases) |case| {
+        const contents = try s.selectionStringSuffix(
+            alloc,
+            sel,
+            case.maximum_bytes,
+        );
+        defer alloc.free(contents);
+        try testing.expect(contents.len <= case.maximum_bytes);
+        try testing.expect(std.unicode.utf8ValidateSlice(contents));
+        try testing.expectEqualStrings(case.expected, contents);
+    }
+
+    var backing: [6]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    const contents = try s.selectionStringSuffix(fixed.allocator(), sel, 5);
+    try testing.expectEqualStrings("🙂Z", contents);
+}
+
+test "Screen: selectionStringSuffix preserves whitespace and soft wraps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("1AB  \n2EFGH3IJKL");
+
+    const sel = Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 4, .y = 2 } }).?,
+        false,
+    );
+    const contents = try s.selectionStringSuffix(alloc, sel, 13);
+    defer alloc.free(contents);
+    try testing.expectEqualStrings("  \n2EFGH3IJKL", contents);
 }
 
 test "Screen: selectionString wide char" {

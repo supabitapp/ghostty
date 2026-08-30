@@ -78,10 +78,16 @@
 
   # SSH Integration
   #
-  # Wrap `ssh` with `ghostty +ssh` and translate the shell-integration
-  # feature flags into command options.
+  var ghostty-bin = /ghostty
+  if (and (has-env GHOSTTY_BIN_DIR) (not-eq $E:GHOSTTY_BIN_DIR "")) {
+    set ghostty-bin = $E:GHOSTTY_BIN_DIR/"ghostty"
+  }
+
+  fn ssh-supaterm {|@args|
+    $E:SUPATERM_CLI_PATH ssh -- $@args
+  }
+
   fn ssh-integration {|@args|
-    var ghostty = $E:GHOSTTY_BIN_DIR/"ghostty"
     var flags = []
     if (not (has-value $features ssh-env)) {
       set flags = (conj $flags --forward-env=false)
@@ -89,7 +95,7 @@
     if (not (has-value $features ssh-terminfo)) {
       set flags = (conj $flags --terminfo=false)
     }
-    $ghostty +ssh $@flags -- $@args
+    $ghostty-bin +ssh $@flags -- $@args
   }
 
   defer {
@@ -119,7 +125,9 @@
   if (and (has-value $features sudo) (not-eq "" $E:TERMINFO) (has-external sudo)) {
     edit:add-var sudo~ $sudo-with-terminfo~
   }
-  if (and (str:contains $E:GHOSTTY_SHELL_FEATURES ssh-) (has-external ssh)) {
+  if (and (has-external ssh) (has-env SUPATERM_CLI_PATH) (not-eq $E:SUPATERM_CLI_PATH "") (not (has-external $ghostty-bin))) {
+    edit:add-var ssh~ $ssh-supaterm~
+  } elif (and (str:contains $E:GHOSTTY_SHELL_FEATURES ssh-) (has-external ssh)) {
     edit:add-var ssh~ $ssh-integration~
   }
 

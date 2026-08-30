@@ -567,6 +567,7 @@ pub const ThreadData = struct {
 
 pub const Config = struct {
     command: ?configpkg.Command = null,
+    command_wrapper: []const [*:0]const u8 = &.{},
     env: EnvMap,
     env_override: configpkg.RepeatableStringMap = .{},
     shell_integration: configpkg.Config.ShellIntegration = .detect,
@@ -591,6 +592,7 @@ const Subprocess = struct {
     cwd: ?[:0]const u8,
     env: ?EnvMap,
     args: []const [:0]const u8,
+    has_command_wrapper: bool,
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
@@ -666,7 +668,6 @@ const Subprocess = struct {
             try env.put("COLORTERM", "truecolor");
         }
 
-        // Add our binary to the path if we can find it.
         ghostty_path: {
             // Skip this for flatpak since host cannot reach them
             if ((comptime build_config.flatpak) and
@@ -684,30 +685,7 @@ const Subprocess = struct {
                 break :ghostty_path;
             }];
             const exe_dir = std.fs.path.dirname(exe_bin_path) orelse break :ghostty_path;
-            log.debug("appending ghostty bin to path dir={s}", .{exe_dir});
-
-            // We always set this so that if the shell overwrites the path
-            // scripts still have a way to find the Ghostty binary when
-            // running in Ghostty.
-            try env.put("GHOSTTY_BIN_DIR", exe_dir);
-
-            // Append if we have a path. We want to append so that ghostty is
-            // the last priority in the path. If we don't have a path set
-            // then we just set it to the directory of the binary.
-            if (env.get("PATH")) |path| {
-                // Verify that our path doesn't already contain this entry
-                var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
-                while (it.next()) |entry| {
-                    if (std.mem.eql(u8, entry, exe_dir)) break :ghostty_path;
-                }
-
-                try env.put(
-                    "PATH",
-                    try appendEnv(alloc, path, exe_dir),
-                );
-            } else {
-                try env.put("PATH", exe_dir);
-            }
+            try configureGhosttyEnvironment(alloc, &env, cfg.command, exe_dir);
         }
 
         // On macOS, export additional data directories from our
@@ -826,7 +804,7 @@ const Subprocess = struct {
         }
 
         // Build our args list
-        const args: []const [:0]const u8 = execCommand(
+        const base_args: []const [:0]const u8 = execCommand(
             alloc,
             shell_command,
             internal_os.passwd,
@@ -850,6 +828,7 @@ const Subprocess = struct {
             // This logs on its own, this is a bad error.
             error.SystemError => return err,
         };
+        const args = try wrappedCommandArgs(alloc, base_args, cfg.command_wrapper);
 
         // We have to copy the cwd because there is no guarantee that
         // pointers in full_config remain valid.
@@ -872,6 +851,7 @@ const Subprocess = struct {
             .env = env,
             .cwd = cwd,
             .args = args,
+            .has_command_wrapper = cfg.command_wrapper.len != 0,
 
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
             .rt_post_fork_info = cfg.rt_post_fork_info,
@@ -1003,6 +983,7 @@ const Subprocess = struct {
                 .stderr = pty.slave,
             } };
             var cmd = &self.process.?.flatpak;
+            try configurePtyForCommand(&pty, self.has_command_wrapper);
             const pid = try cmd.spawn(alloc);
             errdefer killCommandFlatpak(cmd);
 
@@ -1059,7 +1040,12 @@ const Subprocess = struct {
             .data = self,
         };
 
-        cmd.start(alloc) catch |err| {
+        startPtyCommand(
+            &pty,
+            self.has_command_wrapper,
+            &cmd,
+            alloc,
+        ) catch |err| {
             // We have to do this because start on Windows can't
             // ever return ExecFailedInChild
             const StartError = error{ExecFailedInChild} || @TypeOf(err);
@@ -1264,6 +1250,28 @@ const Subprocess = struct {
         return pty.getProcessInfo(info);
     }
 };
+
+fn configurePtyForCommand(pty: *Pty, has_command_wrapper: bool) !void {
+    if (!has_command_wrapper) return;
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios) return;
+
+    const c = @import("pty-c");
+    var attrs: c.termios = undefined;
+    if (c.tcgetattr(pty.master, &attrs) != 0) return error.GetPtyModeFailed;
+    c.cfmakeraw(&attrs);
+    if (c.tcsetattr(pty.master, c.TCSANOW, &attrs) != 0)
+        return error.SetPtyModeFailed;
+}
+
+fn startPtyCommand(
+    pty: *Pty,
+    has_command_wrapper: bool,
+    command: *Command,
+    alloc: Allocator,
+) !void {
+    try configurePtyForCommand(pty, has_command_wrapper);
+    try command.start(alloc);
+}
 
 /// The read thread works with a companion gather thread to form a two-stage
 /// pipeline that moves pty output into the terminal:
@@ -1938,7 +1946,9 @@ fn execCommand(
             // Direct args can be passed directly to login, since
             // login uses execvp we don't need to worry about PATH
             // searching.
-            .direct => |v| try args.appendSlice(alloc, v),
+            .direct => |v| for (v) |arg| {
+                try args.append(alloc, try alloc.dupeZ(u8, arg));
+            },
 
             .shell => |v| {
                 // Use "exec" to replace the bash process with
@@ -2019,7 +2029,7 @@ fn execCommand(
                 try args.append(alloc, "-c");
             }
 
-            try args.append(alloc, v);
+            try args.append(alloc, try alloc.dupeZ(u8, v));
             break :shell try args.toOwnedSlice(alloc);
         },
     };
@@ -2056,11 +2066,254 @@ fn appendEnvAlways(
     });
 }
 
+fn configureGhosttyEnvironment(
+    alloc: Allocator,
+    env: *EnvMap,
+    command: ?configpkg.Command,
+    exe_dir: []const u8,
+) Allocator.Error!void {
+    try env.put("GHOSTTY_BIN_DIR", exe_dir);
+
+    if (command) |value| switch (value) {
+        .direct => return,
+        .shell => {},
+    };
+
+    log.debug("appending ghostty bin to path dir={s}", .{exe_dir});
+    if (env.get("PATH")) |path| {
+        var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry, exe_dir)) return;
+        }
+
+        try env.put("PATH", try appendEnv(alloc, path, exe_dir));
+    } else {
+        try env.put("PATH", exe_dir);
+    }
+}
+
 /// Get information about the process(es) running within the backend. Returns
 /// `null` if there was an error getting the information or the information is
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Exec, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.subprocess.getProcessInfo(info);
+}
+
+fn wrappedCommandArgs(
+    alloc: Allocator,
+    base_args: []const [:0]const u8,
+    wrapper: []const [*:0]const u8,
+) Allocator.Error![]const [:0]const u8 {
+    if (wrapper.len == 0) return base_args;
+
+    const args = try alloc.alloc([:0]const u8, wrapper.len + base_args.len);
+    for (wrapper, args[0..wrapper.len]) |arg, *result| {
+        result.* = std.mem.span(arg);
+    }
+    @memcpy(args[wrapper.len..], base_args);
+    return args;
+}
+
+fn testPtyModeAtSpawn(has_command_wrapper: bool) !void {
+    const testing = std.testing;
+    var pty = try Pty.open(.{});
+    defer pty.deinit();
+    defer _ = posix.system.close(pty.slave);
+
+    try testing.expect(ReadThread.setNonblock(pty.master));
+    try testing.expect(ReadThread.setNonblock(pty.slave));
+
+    var state: struct {
+        pty: *Pty,
+        has_command_wrapper: bool,
+        called: bool = false,
+
+        fn postFork(command: *Command) Command.PostForkError!void {
+            const self = command.getData(@This()) orelse
+                return error.PostForkError;
+            self.called = true;
+
+            const mode = self.pty.getMode() catch return error.PostForkError;
+            const expected_cooked = !self.has_command_wrapper;
+            if (mode.canonical != expected_cooked or
+                mode.echo != expected_cooked)
+            {
+                return error.PostForkError;
+            }
+
+            if (posix.system.write(self.pty.master, "x", 1) != 1)
+                return error.PostForkError;
+
+            var input: [1]u8 = undefined;
+            const input_result = posix.system.read(self.pty.slave, &input, input.len);
+            const input_errno = posix.errno(input_result);
+            var echo: [1]u8 = undefined;
+            const echo_result = posix.system.read(self.pty.master, &echo, echo.len);
+            const echo_errno = posix.errno(echo_result);
+
+            if (self.has_command_wrapper) {
+                if (input_errno != .SUCCESS or input_result != 1 or input[0] != 'x')
+                    return error.PostForkError;
+                if (echo_errno != .AGAIN) return error.PostForkError;
+            } else {
+                if (input_errno != .AGAIN) return error.PostForkError;
+                if (echo_errno != .SUCCESS or echo_result != 1 or echo[0] != 'x')
+                    return error.PostForkError;
+            }
+        }
+    } = .{
+        .pty = &pty,
+        .has_command_wrapper = has_command_wrapper,
+    };
+
+    var command: Command = .{
+        .path = "/bin/sh",
+        .args = &.{ "/bin/sh", "-c", "exit 0" },
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = @TypeOf(state).postFork,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+        .data = &state,
+    };
+
+    startPtyCommand(
+        &pty,
+        has_command_wrapper,
+        &command,
+        testing.allocator,
+    ) catch |err| {
+        if (command.pid != null) _ = command.wait(true) catch {};
+        return err;
+    };
+
+    try testing.expect(state.called);
+    const exit = try command.wait(true);
+    try testing.expect(exit == .Exited);
+    try testing.expectEqual(@as(u8, 0), exit.Exited);
+}
+
+test "command wrapper PTY is raw before spawn" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios)
+        return error.SkipZigTest;
+    try testPtyModeAtSpawn(true);
+}
+
+test "command without wrapper PTY is cooked before spawn" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios)
+        return error.SkipZigTest;
+    try testPtyModeAtSpawn(false);
+}
+
+test "PTY mode setup only reads wrapped PTY" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios)
+        return error.SkipZigTest;
+
+    var pty: Pty = .{ .master = -1, .slave = -1 };
+    try configurePtyForCommand(&pty, false);
+    try std.testing.expectError(
+        error.GetPtyModeFailed,
+        configurePtyForCommand(&pty, true),
+    );
+}
+
+test "wrappedCommandArgs prepends Zmx wrapper arguments" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const base_args: []const [:0]const u8 = &.{ "/bin/zsh", "-l" };
+    const unwrapped = try wrappedCommandArgs(alloc, base_args, &.{});
+    try testing.expectEqual(@intFromPtr(base_args.ptr), @intFromPtr(unwrapped.ptr));
+
+    const create_wrapper = [_][*:0]const u8{
+        "/Applications/Supaterm.app/Contents/Helpers/zmx",
+        "attach",
+        "123e4567-e89b-12d3-a456-426614174000",
+    };
+    const existing_wrapper = [_][*:0]const u8{
+        "/Applications/Supaterm.app/Contents/Helpers/zmx",
+        "attach",
+        "--existing",
+        "123e4567-e89b-12d3-a456-426614174000",
+    };
+    const create_expected = [_][]const u8{
+        "/Applications/Supaterm.app/Contents/Helpers/zmx",
+        "attach",
+        "123e4567-e89b-12d3-a456-426614174000",
+        "/bin/zsh",
+        "-l",
+    };
+    const existing_expected = [_][]const u8{
+        "/Applications/Supaterm.app/Contents/Helpers/zmx",
+        "attach",
+        "--existing",
+        "123e4567-e89b-12d3-a456-426614174000",
+        "/bin/zsh",
+        "-l",
+    };
+    const cases = [_]struct {
+        wrapper: []const [*:0]const u8,
+        expected: []const []const u8,
+    }{
+        .{ .wrapper = &create_wrapper, .expected = &create_expected },
+        .{ .wrapper = &existing_wrapper, .expected = &existing_expected },
+    };
+
+    for (cases) |case| {
+        const result = try wrappedCommandArgs(alloc, base_args, case.wrapper);
+        try testing.expectEqual(case.expected.len, result.len);
+        for (case.expected, result) |expected, actual| {
+            try testing.expectEqualStrings(expected, actual);
+        }
+        try testing.expectEqual(
+            @intFromPtr(case.wrapper[0]),
+            @intFromPtr(result[0].ptr),
+        );
+    }
+}
+
+test "direct command preserves PATH" {
+    const testing = std.testing;
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", "");
+
+    try configureGhosttyEnvironment(
+        testing.allocator,
+        &env,
+        .{ .direct = &.{"command"} },
+        "/ghostty/bin",
+    );
+
+    try testing.expectEqualStrings("", env.get("PATH").?);
+    try testing.expectEqualStrings("/ghostty/bin", env.get("GHOSTTY_BIN_DIR").?);
+}
+
+test "shell command appends Ghostty bin to PATH" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", "/usr/bin");
+
+    try configureGhosttyEnvironment(
+        arena.allocator(),
+        &env,
+        .{ .shell = "zsh" },
+        "/ghostty/bin",
+    );
+
+    const expected = try std.fmt.allocPrint(
+        testing.allocator,
+        "/usr/bin{c}/ghostty/bin",
+        .{std.fs.path.delimiter},
+    );
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, env.get("PATH").?);
+    try testing.expectEqualStrings("/ghostty/bin", env.get("GHOSTTY_BIN_DIR").?);
 }
 
 test "execCommand darwin: shell command" {
@@ -2117,6 +2370,37 @@ test "execCommand darwin: direct command" {
     try testing.expectEqualStrings(result[4], "bar baz");
 }
 
+test "execCommand darwin: direct command owns arguments" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var command_arena = ArenaAllocator.init(testing.allocator);
+    const command = try (configpkg.Command{ .direct = &.{
+        "foo",
+        "bar baz",
+        "",
+    } }).clone(command_arena.allocator());
+
+    const result = try execCommand(alloc, command, struct {
+        fn get(_: Allocator) !PasswdEntry {
+            return .{ .name = "testuser" };
+        }
+    });
+    command_arena.deinit();
+
+    try testing.expectEqual(6, result.len);
+    try testing.expectEqualStrings("/usr/bin/login", result[0]);
+    try testing.expectEqualStrings("-flp", result[1]);
+    try testing.expectEqualStrings("testuser", result[2]);
+    try testing.expectEqualStrings("foo", result[3]);
+    try testing.expectEqualStrings("bar baz", result[4]);
+    try testing.expectEqualStrings("", result[5]);
+}
+
 test "execCommand: shell command, empty passwd" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -2166,6 +2450,25 @@ test "execCommand: shell command, error passwd" {
     try testing.expectEqual(3, result.len);
     try testing.expectEqualStrings(result[0], "/bin/sh");
     try testing.expectEqualStrings(result[1], "-c");
+    try testing.expectEqualStrings(result[2], "foo bar baz");
+}
+
+test "execCommand: shell command owns fallback argument" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const command = try testing.allocator.dupeZ(u8, "foo bar baz");
+    defer testing.allocator.free(command);
+    const result = try execCommand(arena.allocator(), .{ .shell = command }, struct {
+        fn get(_: Allocator) !PasswdEntry {
+            return error.Fail;
+        }
+    });
+    @memset(command, 'x');
+
     try testing.expectEqualStrings(result[2], "foo bar baz");
 }
 

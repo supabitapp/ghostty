@@ -513,11 +513,15 @@ typedef struct {
   float font_size;
   const char* working_directory;
   const char* command;
+  const char* const* command_argv;
+  size_t command_argv_count;
   ghostty_env_var_s* env_vars;
   size_t env_var_count;
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  const char* const* command_wrapper;
+  size_t command_wrapper_count;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1009,6 +1013,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
+  GHOSTTY_ACTION_SHELL_READY,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1173,6 +1178,7 @@ GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
+GHOSTTY_API void ghostty_surface_inherited_config_free(ghostty_surface_t, ghostty_surface_config_s*);
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
@@ -1230,6 +1236,13 @@ GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_read_text_suffix(ghostty_surface_t,
+                                                     ghostty_selection_s,
+                                                     size_t,
+                                                     ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_read_text_tail(ghostty_surface_t,
+                                                   uint32_t,
+                                                   ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__
