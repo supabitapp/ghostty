@@ -1283,10 +1283,11 @@ pub const Surface = struct {
                     return;
                 };
                 defer conv_alloc.free(contents);
-                for (kitty.contents, contents) |src, *dst| dst.* = .{
+                for (kitty.contents, contents, 0..) |src, *dst, i| dst.* = .{
                     .mime = src.mime,
                     .data = src.data.ptr,
                     .len = src.data.len,
+                    .payload_id = src.payload_id orelse i,
                 };
 
                 self.app.opts.confirm_read_clipboard(
@@ -1425,6 +1426,7 @@ pub const Surface = struct {
                 .mime = content.mime,
                 .data = content.data.ptr,
                 .len = content.data.len,
+                .payload_id = content.payload_id orelse i,
             };
         }
 
@@ -1627,6 +1629,13 @@ pub const Surface = struct {
     pub fn occlusionCallback(self: *Surface, visible: bool) void {
         self.core_surface.occlusionCallback(visible) catch |err| {
             log.err("error in occlusion callback err={}", .{err});
+            return;
+        };
+    }
+
+    pub fn rendererVisibilityCallback(self: *Surface, visible: bool) void {
+        self.core_surface.rendererVisibilityCallback(visible) catch |err| {
+            log.err("error in renderer visibility callback err={}", .{err});
             return;
         };
     }
@@ -2003,6 +2012,7 @@ pub const CAPI = struct {
         mime: [*:0]const u8,
         data: [*]const u8,
         len: usize,
+        payload_id: usize,
     };
 
     // ghostty_clipboard_complete_s
@@ -2543,6 +2553,10 @@ pub const CAPI = struct {
     /// Update the occlusion state of a surface.
     export fn ghostty_surface_set_occlusion(surface: *Surface, visible: bool) void {
         surface.occlusionCallback(visible);
+    }
+
+    export fn ghostty_surface_set_renderer_visibility(surface: *Surface, visible: bool) void {
+        surface.rendererVisibilityCallback(visible);
     }
 
     /// Filter the mods if necessary. This handles settings such as

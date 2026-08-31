@@ -3354,10 +3354,13 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
         } }, .unlocked);
     }
 
+    try self.rendererVisibilityCallback(visible);
+}
+
+pub fn rendererVisibilityCallback(self: *Surface, visible: bool) !void {
     _ = self.renderer_thread.mailbox.push(global.io(), .{
         .visible = visible,
     }, .{ .forever = {} });
-
     try self.queueRender();
 }
 

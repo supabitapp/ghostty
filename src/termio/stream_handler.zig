@@ -1368,21 +1368,35 @@ pub const StreamHandler = struct {
             apprt.ClipboardContent,
             committed.contents.len,
         );
+        const PayloadKey = struct {
+            address: usize,
+            len: usize,
+        };
+        const Payload = struct {
+            data: [:0]const u8,
+            id: usize,
+        };
+        var payloads: std.AutoHashMapUnmanaged(PayloadKey, Payload) = .empty;
+        defer payloads.deinit(self.alloc);
         for (committed.contents, contents, 0..) |src, *dst, i| {
-            const data = data: {
-                for (committed.contents[0..i], contents[0..i]) |prior_src, prior_dst| {
-                    if (src.data.ptr == prior_src.data.ptr and
-                        src.data.len == prior_src.data.len)
-                    {
-                        break :data prior_dst.data;
-                    }
-                }
-
-                break :data try alloc.dupeZ(u8, src.data);
+            const key: PayloadKey = .{
+                .address = @intFromPtr(src.data.ptr),
+                .len = src.data.len,
+            };
+            const payload = if (payloads.get(key)) |payload|
+                payload
+            else payload: {
+                const payload: Payload = .{
+                    .data = try alloc.dupeZ(u8, src.data),
+                    .id = i,
+                };
+                try payloads.put(self.alloc, key, payload);
+                break :payload payload;
             };
             dst.* = .{
                 .mime = try alloc.dupeZ(u8, src.mime),
-                .data = data,
+                .data = payload.data,
+                .payload_id = payload.id,
             };
         }
         const id = try alloc.dupe(u8, committed.id);
@@ -2090,6 +2104,8 @@ test "kitty clipboard write: aliases share one owned request payload" {
     try testing.expectEqualStrings("source", req.name);
     try testing.expectEqualStrings("Ghostty", req.contents[0].data);
     try testing.expectEqualStrings("PNG", req.contents[1].data);
+    try testing.expectEqual(@as(?usize, 0), req.contents[0].payload_id);
+    try testing.expectEqual(@as(?usize, 1), req.contents[1].payload_id);
     try testing.expect(
         req.contents[0].data.ptr != req.contents[1].data.ptr,
     );
@@ -2099,5 +2115,6 @@ test "kitty clipboard write: aliases share one owned request payload" {
             @intFromPtr(req.contents[0].data.ptr),
             @intFromPtr(content.data.ptr),
         );
+        try testing.expectEqual(req.contents[0].payload_id, content.payload_id);
     }
 }

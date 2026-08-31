@@ -84,6 +84,7 @@ typedef struct {
   const char *mime;
   const char *data;
   size_t len;
+  size_t payload_id;
 } ghostty_clipboard_content_s;
 
 // The payload for completing a clipboard read request. See
@@ -1188,6 +1189,7 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+GHOSTTY_API void ghostty_surface_set_renderer_visibility(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);

@@ -444,7 +444,7 @@ extension Ghostty {
             }
 
             var cContents: [ghostty_clipboard_content_s] = []
-            for entry in contents {
+            for (payloadID, entry) in contents.enumerated() {
                 guard let mime = strdup(entry.mime) else { continue }
                 cStrings.append(mime)
                 let buf = UnsafeMutableRawPointer.allocate(
@@ -459,7 +459,8 @@ extension Ghostty {
                 cContents.append(ghostty_clipboard_content_s(
                     mime: mime,
                     data: buf.assumingMemoryBound(to: CChar.self),
-                    len: entry.data.count))
+                    len: entry.data.count,
+                    payload_id: payloadID))
             }
 
             var cAvailable: [UnsafePointer<CChar>?] = []

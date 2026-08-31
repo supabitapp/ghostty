@@ -63,6 +63,7 @@ pub const Clipboard = enum(Backing) {
 pub const ClipboardContent = struct {
     mime: [:0]const u8,
     data: [:0]const u8,
+    payload_id: ?usize = null,
 };
 
 pub const ClipboardRequestType = enum(c_int) {
