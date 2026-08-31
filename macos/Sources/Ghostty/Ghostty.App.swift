@@ -62,13 +62,14 @@ extension Ghostty {
                 action_cb: { app, target, action in App.action(app!, target: target, action: action) },
                 read_clipboard_cb: { userdata, loc, state, request, mimes, mimesLen, list in
                     App.readClipboard(
-                        userdata,
-                        location: loc,
-                        state: state,
-                        request: request,
-                        mimes: mimes,
-                        mimesLen: mimesLen,
-                        list: list) },
+                        .init(
+                            userdata: userdata,
+                            location: loc,
+                            state: state,
+                            request: request,
+                            mimes: mimes,
+                            mimesLen: mimesLen,
+                            list: list)) },
                 confirm_read_clipboard_cb: { userdata, confirm, state, request in
                     App.confirmReadClipboard(
                         userdata,
@@ -296,22 +297,24 @@ extension Ghostty {
             ])
         }
 
-        static func readClipboard(
-            _ userdata: UnsafeMutableRawPointer?,
-            location: ghostty_clipboard_e,
-            state: UnsafeMutableRawPointer?,
-            request: ghostty_clipboard_request_e,
-            mimes: UnsafePointer<UnsafePointer<CChar>?>?,
-            mimesLen: Int,
-            list: Bool
-        ) -> ghostty_clipboard_read_result_e {
-            let surfaceView = self.surfaceUserdata(from: userdata)
+        private struct ReadClipboardCallback {
+            let userdata: UnsafeMutableRawPointer?
+            let location: ghostty_clipboard_e
+            let state: UnsafeMutableRawPointer?
+            let request: ghostty_clipboard_request_e
+            let mimes: UnsafePointer<UnsafePointer<CChar>?>?
+            let mimesLen: Int
+            let list: Bool
+        }
+
+        private static func readClipboard(_ callback: ReadClipboardCallback) -> ghostty_clipboard_read_result_e {
+            let surfaceView = self.surfaceUserdata(from: callback.userdata)
             guard let surface = surfaceView.surface else {
                 return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED
             }
 
             // Get our pasteboard
-            guard let pasteboard = NSPasteboard.ghostty(location) else {
+            guard let pasteboard = NSPasteboard.ghostty(callback.location) else {
                 return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED
             }
 
@@ -321,23 +324,23 @@ extension Ghostty {
             // contents are never loaded.
             var contents: [Ghostty.ClipboardContent] = []
             var seen = Set<String>()
-            if let mimes {
-                for i in 0..<mimesLen {
+            if let mimes = callback.mimes {
+                for i in 0..<callback.mimesLen {
                     guard let ptr = mimes[i] else { continue }
                     let mime = String(cString: ptr)
                     guard !seen.contains(mime) else { continue }
                     seen.insert(mime)
-                    guard let data = pasteboard.ghosttyData(forMime: mime, request: request) else { continue }
+                    guard let data = pasteboard.ghosttyData(forMime: mime, request: callback.request) else { continue }
                     contents.append(.init(mime: mime, data: data))
                 }
             }
 
             // The listing of available types, only gathered when requested.
-            let available: [String] = list ? pasteboard.ghosttyAvailableMimes() : []
+            let available: [String] = callback.list ? pasteboard.ghosttyAvailableMimes() : []
 
             // With nothing to serve and no listing requested there is
             // nothing to complete the read with.
-            if contents.isEmpty && !list {
+            if contents.isEmpty && !callback.list {
                 return GHOSTTY_CLIPBOARD_READ_UNAVAILABLE
             }
 
@@ -345,7 +348,7 @@ extension Ghostty {
                 surface,
                 contents: contents,
                 available: available,
-                state: state)
+                state: callback.state)
             return GHOSTTY_CLIPBOARD_READ_STARTED
         }
 
@@ -444,7 +447,7 @@ extension Ghostty {
             }
 
             var cContents: [ghostty_clipboard_content_s] = []
-            for (payloadID, entry) in contents.enumerated() {
+            for entry in contents {
                 guard let mime = strdup(entry.mime) else { continue }
                 cStrings.append(mime)
                 let buf = UnsafeMutableRawPointer.allocate(
@@ -459,8 +462,7 @@ extension Ghostty {
                 cContents.append(ghostty_clipboard_content_s(
                     mime: mime,
                     data: buf.assumingMemoryBound(to: CChar.self),
-                    len: entry.data.count,
-                    payload_id: payloadID))
+                    len: entry.data.count))
             }
 
             var cAvailable: [UnsafePointer<CChar>?] = []
@@ -910,6 +912,15 @@ extension Ghostty {
             return true
         }
 
+        private static func inheritedSurfaceConfiguration(
+            _ surface: ghostty_surface_t,
+            context: ghostty_surface_context_e
+        ) -> SurfaceConfiguration {
+            var config = ghostty_surface_inherited_config(surface, context)
+            defer { ghostty_surface_inherited_config_free(surface, &config) }
+            return SurfaceConfiguration(from: config)
+        }
+
         private static func newWindow(_ app: ghostty_app_t, target: ghostty_target_s) {
             switch target.tag {
             case GHOSTTY_TARGET_APP:
@@ -926,7 +937,7 @@ extension Ghostty {
                     name: Notification.ghosttyNewWindow,
                     object: surfaceView,
                     userInfo: [
-                        Notification.NewSurfaceConfigKey: SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_WINDOW)),
+                        Notification.NewSurfaceConfigKey: inheritedSurfaceConfiguration(surface, context: GHOSTTY_SURFACE_CONTEXT_WINDOW),
                     ]
                 )
 
@@ -962,7 +973,7 @@ extension Ghostty {
                     name: Notification.ghosttyNewTab,
                     object: surfaceView,
                     userInfo: [
-                        Notification.NewSurfaceConfigKey: SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_TAB)),
+                        Notification.NewSurfaceConfigKey: inheritedSurfaceConfiguration(surface, context: GHOSTTY_SURFACE_CONTEXT_TAB),
                     ]
                 )
 
@@ -990,7 +1001,7 @@ extension Ghostty {
                     object: surfaceView,
                     userInfo: [
                         "direction": direction,
-                        Notification.NewSurfaceConfigKey: SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_SPLIT)),
+                        Notification.NewSurfaceConfigKey: inheritedSurfaceConfiguration(surface, context: GHOSTTY_SURFACE_CONTEXT_SPLIT),
                     ]
                 )
 

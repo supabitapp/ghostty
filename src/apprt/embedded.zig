@@ -1283,11 +1283,10 @@ pub const Surface = struct {
                     return;
                 };
                 defer conv_alloc.free(contents);
-                for (kitty.contents, contents, 0..) |src, *dst, i| dst.* = .{
+                for (kitty.contents, contents) |src, *dst| dst.* = .{
                     .mime = src.mime,
                     .data = src.data.ptr,
                     .len = src.data.len,
-                    .payload_id = src.payload_id orelse i,
                 };
 
                 self.app.opts.confirm_read_clipboard(
@@ -1421,12 +1420,11 @@ pub const Surface = struct {
         const alloc = self.app.core_app.alloc;
         const array = try alloc.alloc(CAPI.ClipboardContent, contents.len);
         defer alloc.free(array);
-        for (contents, 0..) |content, i| {
-            array[i] = .{
+        for (contents, array) |content, *dst| {
+            dst.* = .{
                 .mime = content.mime,
                 .data = content.data.ptr,
                 .len = content.data.len,
-                .payload_id = content.payload_id orelse i,
             };
         }
 
@@ -1638,6 +1636,10 @@ pub const Surface = struct {
             log.err("error in renderer visibility callback err={}", .{err});
             return;
         };
+    }
+
+    pub fn rendererBarrier(self: *Surface) void {
+        self.core_surface.rendererBarrier();
     }
 
     fn queueInspectorRender(self: *Surface) void {
@@ -2012,7 +2014,6 @@ pub const CAPI = struct {
         mime: [*:0]const u8,
         data: [*]const u8,
         len: usize,
-        payload_id: usize,
     };
 
     // ghostty_clipboard_complete_s
@@ -2557,6 +2558,10 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_set_renderer_visibility(surface: *Surface, visible: bool) void {
         surface.rendererVisibilityCallback(visible);
+    }
+
+    export fn ghostty_surface_renderer_barrier(surface: *Surface) void {
+        surface.rendererBarrier();
     }
 
     /// Filter the mods if necessary. This handles settings such as

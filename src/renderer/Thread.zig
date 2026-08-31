@@ -337,6 +337,8 @@ fn drainMailbox(self: *Thread) !void {
                 // check the visible state themselves to control their behavior.
             },
 
+            .barrier => |done| done.post(global.io()),
+
             .focus => |v| focus: {
                 // If our state didn't change we do nothing.
                 if (self.flags.focused == v) break :focus;

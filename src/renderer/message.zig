@@ -22,6 +22,8 @@ pub const Message = union(enum) {
     /// and still have focus.
     visible: bool,
 
+    barrier: *std.Io.Semaphore,
+
     /// Reset the cursor blink by immediately showing the cursor then
     /// restarting the timer.
     reset_cursor_blink,

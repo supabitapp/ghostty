@@ -51,3 +51,21 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
       - name: Build GTK
         run: nix develop -c zig build -Dapp-runtime=gtk
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654
+        with:
+          version: 2026.7.13
+          install: false
+      - name: Read Zig version
+        run: echo "GHOSTTY_ZIG_VERSION=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_ENV"
+      - name: Build GhosttyKit
+        run: mise x "zig@$GHOSTTY_ZIG_VERSION" -- zig build -Demit-macos-app=false
+      - name: Test macOS app
+        run: mise x aqua:nushell/nushell@0.114.1 -- nu macos/build.nu --action test
+      - name: Check Swift
+        run: mise x swiftlint@0.65.0 -- swiftlint lint --strict

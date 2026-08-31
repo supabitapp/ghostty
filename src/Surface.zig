@@ -3364,6 +3364,15 @@ pub fn rendererVisibilityCallback(self: *Surface, visible: bool) !void {
     try self.queueRender();
 }
 
+pub fn rendererBarrier(self: *Surface) void {
+    var done: std.Io.Semaphore = .{};
+    _ = self.renderer_thread.mailbox.push(global.io(), .{
+        .barrier = &done,
+    }, .{ .forever = {} });
+    self.queueRender() catch unreachable;
+    done.waitUncancelable(global.io());
+}
+
 pub fn focusCallback(self: *Surface, focused: bool) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();

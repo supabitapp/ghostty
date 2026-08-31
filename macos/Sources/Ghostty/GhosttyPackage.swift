@@ -253,7 +253,7 @@ extension Ghostty {
             guard count >= 0 else { return [] }
 
             struct Payload: Hashable {
-                let id: Int
+                let address: Int
                 let count: Int
             }
 
@@ -271,7 +271,7 @@ extension Ghostty {
                 }
 
                 let payload = Payload(
-                    id: content.payload_id,
+                    address: Int(bitPattern: data),
                     count: content.len)
                 let ownedData: Data
                 if let existing = dataByPayload[payload] {
