@@ -508,17 +508,16 @@ extension Ghostty {
             if !confirm {
                 // Apply writes allowed by policy immediately. Only writes that
                 // require confirmation continue to the pending request below.
-                let types = contentArray.compactMap { item in
-                    NSPasteboard.PasteboardType(mimeType: item.mime)
+                let values = contentArray.compactMap { item in
+                    NSPasteboard.PasteboardType(mimeType: item.mime).map { ($0, item.data) }
                 }
-                guard !types.isEmpty else { return false }
-                pasteboard.declareTypes(types, owner: nil)
+                guard !values.isEmpty else { return false }
+                pasteboard.declareTypes(values.map(\.0), owner: nil)
 
                 // Set data for each type
                 var wroteAll = true
-                for item in contentArray {
-                    guard let type = NSPasteboard.PasteboardType(mimeType: item.mime) else { continue }
-                    wroteAll = pasteboard.setData(item.data, forType: type) && wroteAll
+                for (type, data) in values {
+                    wroteAll = pasteboard.setData(data, forType: type) && wroteAll
                 }
                 return wroteAll
             }
