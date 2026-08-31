@@ -24,6 +24,42 @@ extension NSPasteboard.PasteboardType {
         // Use the UTType's identifier
         self.init(utType.identifier)
     }
+
+    fileprivate var ghosttyMimeType: String? {
+        let mime = UTType(rawValue)?.preferredMIMEType
+            ?? UTType(mimeType: rawValue)?.preferredMIMEType
+        guard let mime else { return nil }
+        return mime.hasPrefix("text/plain;") ? "text/plain" : mime
+    }
+}
+
+private final class GhosttyPasteboardDataProvider: NSObject, NSPasteboardItemDataProvider {
+    let types: [NSPasteboard.PasteboardType]
+    private let dataByType: [NSPasteboard.PasteboardType: Data]
+
+    init(contents: [Ghostty.ClipboardContent]) {
+        var types: [NSPasteboard.PasteboardType] = []
+        var dataByType: [NSPasteboard.PasteboardType: Data] = [:]
+        for content in contents {
+            guard let type = NSPasteboard.PasteboardType(mimeType: content.mime) else { continue }
+            if dataByType[type] == nil {
+                types.append(type)
+            }
+            dataByType[type] = content.data
+        }
+
+        self.types = types
+        self.dataByType = dataByType
+    }
+
+    func pasteboard(
+        _ pasteboard: NSPasteboard?,
+        item: NSPasteboardItem,
+        provideDataForType type: NSPasteboard.PasteboardType
+    ) {
+        guard let data = dataByType[type] else { return }
+        item.setData(data, forType: type)
+    }
 }
 
 extension NSPasteboard {
@@ -72,7 +108,8 @@ extension NSPasteboard {
             return Data(str.utf8)
 
         case "text/plain":
-            return data(forType: .string)
+            guard let type = ghosttyDeclaredType(forMime: mime) else { return nil }
+            return data(forType: type)
 
         case "text/uri-list":
             let urls = ghosttyFileURLs
@@ -80,9 +117,24 @@ extension NSPasteboard {
             return Data(urls.map { $0.absoluteString + "\r\n" }.joined().utf8)
 
         default:
-            guard let type = NSPasteboard.PasteboardType(mimeType: mime) else { return nil }
+            guard let type = ghosttyDeclaredType(forMime: mime) else { return nil }
             return data(forType: type)
         }
+    }
+
+    private func ghosttyDeclaredType(forMime mime: String) -> NSPasteboard.PasteboardType? {
+        let declared = types ?? []
+        let exact = NSPasteboard.PasteboardType(mime)
+        if declared.contains(exact) {
+            return exact
+        }
+
+        if let mapped = NSPasteboard.PasteboardType(mimeType: mime),
+           declared.contains(mapped) {
+            return mapped
+        }
+
+        return declared.first { $0.ghosttyMimeType == mime }
     }
 
     /// The MIME types available on the pasteboard, best-effort mapped
@@ -93,17 +145,9 @@ extension NSPasteboard {
         var result: [String] = []
         var seen = Set<String>()
         let availableTypes = types ?? []
-        let mimeType: (NSPasteboard.PasteboardType) -> String? = { type in
-            guard let mime = UTType(type.rawValue)?.preferredMIMEType else { return nil }
-            return mime == "text/plain;charset=utf-8" ? "text/plain" : mime
-        }
-
-        // Plain text and copied files can both be served as the canonical
-        // text representation. Infer this from declared types so lazy
-        // pasteboard providers are not asked for their contents.
         let hasFileURL = availableTypes.contains(.fileURL)
-        let hasPlainText = hasFileURL || availableTypes.contains { type in
-            mimeType(type) == "text/plain"
+        let hasPlainText = availableTypes.contains { type in
+            type.ghosttyMimeType == "text/plain"
         }
         if hasPlainText {
             result.append("text/plain")
@@ -119,13 +163,24 @@ extension NSPasteboard {
         }
 
         for type in availableTypes {
-            guard let mime = mimeType(type),
+            guard let mime = type.ghosttyMimeType,
                   !seen.contains(mime) else { continue }
             seen.insert(mime)
             result.append(mime)
         }
 
         return result
+    }
+
+    func writeGhosttyContents(_ contents: [Ghostty.ClipboardContent]) -> Bool {
+        let provider = GhosttyPasteboardDataProvider(contents: contents)
+        guard !provider.types.isEmpty else { return false }
+
+        let item = NSPasteboardItem()
+        guard item.setDataProvider(provider, forTypes: provider.types) else { return false }
+
+        clearContents()
+        return writeObjects([item])
     }
 
     /// The pasteboard for the Ghostty enum type. Returns nil for locations

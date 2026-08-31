@@ -1342,9 +1342,23 @@ pub const StreamHandler = struct {
         const pw: []const u8 = if (committed.name.len > 0) committed.pw else "";
         const granted = self.kitty_clipboard_grants.use(self.alloc, pw, .write);
 
-        // Everything about the request, including the request struct
-        // itself, lives in a single arena that crosses to the surface
-        // thread, which owns it from the moment the message is sent.
+        const req = try self.kittyClipboardWriteRequest(
+            &committed,
+            pw,
+            granted,
+            terminator,
+        );
+
+        self.surfaceMessageWriter(.{ .kitty_clipboard_write = req });
+    }
+
+    fn kittyClipboardWriteRequest(
+        self: *StreamHandler,
+        committed: *const terminal.kitty.clipboard.WriteState.Committed,
+        pw: []const u8,
+        granted: bool,
+        terminator: terminal.osc.Terminator,
+    ) Allocator.Error!*apprt.ClipboardRequest.KittyWrite {
         var arena: std.heap.ArenaAllocator = .init(self.alloc);
         errdefer arena.deinit();
         const alloc = arena.allocator();
@@ -1354,10 +1368,23 @@ pub const StreamHandler = struct {
             apprt.ClipboardContent,
             committed.contents.len,
         );
-        for (committed.contents, contents) |src, *dst| dst.* = .{
-            .mime = try alloc.dupeZ(u8, src.mime),
-            .data = try alloc.dupeZ(u8, src.data),
-        };
+        for (committed.contents, contents, 0..) |src, *dst, i| {
+            const data = data: {
+                for (committed.contents[0..i], contents[0..i]) |prior_src, prior_dst| {
+                    if (src.data.ptr == prior_src.data.ptr and
+                        src.data.len == prior_src.data.len)
+                    {
+                        break :data prior_dst.data;
+                    }
+                }
+
+                break :data try alloc.dupeZ(u8, src.data);
+            };
+            dst.* = .{
+                .mime = try alloc.dupeZ(u8, src.mime),
+                .data = data,
+            };
+        }
         const id = try alloc.dupe(u8, committed.id);
         const pw_owned = try alloc.dupe(u8, pw);
         const name_owned = try alloc.dupeZ(u8, committed.name);
@@ -1377,7 +1404,7 @@ pub const StreamHandler = struct {
             .terminator = terminator,
         };
 
-        self.surfaceMessageWriter(.{ .kitty_clipboard_write = req });
+        return req;
     }
 
     /// Answer the write transaction with its final status and drop it.
@@ -1998,4 +2025,79 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "kitty clipboard write: aliases share one owned request payload" {
+    const testing = std.testing;
+
+    const req = req: {
+        var state: terminal.kitty.clipboard.WriteState = try .init(
+            testing.allocator,
+            &.{ .op = .write, .id = "aliases", .name = "source" },
+            .{},
+        );
+        defer state.deinit(testing.allocator);
+
+        try state.data(
+            testing.allocator,
+            &.{ .op = .wdata, .mime = "text/plain" },
+            "R2hvc3R0eQ==",
+        );
+        try state.data(
+            testing.allocator,
+            &.{ .op = .wdata, .mime = "image/png" },
+            "UE5H",
+        );
+
+        var aliases: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aliases.deinit();
+        for (0..terminal.kitty.clipboard.max_write_aliases) |i| {
+            if (i > 0) try aliases.writer.writeByte(' ');
+            try aliases.writer.print("alias{d}", .{i});
+        }
+
+        var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer encoded.deinit();
+        try std.base64.standard.Encoder.encodeWriter(
+            &encoded.writer,
+            aliases.written(),
+        );
+        try state.alias(
+            testing.allocator,
+            &.{ .op = .walias, .mime = "text/plain" },
+            encoded.written(),
+        );
+
+        const committed = try state.commit(testing.allocator);
+        defer committed.deinit(testing.allocator);
+
+        var handler: StreamHandler = undefined;
+        handler.alloc = testing.allocator;
+        break :req try handler.kittyClipboardWriteRequest(
+            &committed,
+            "",
+            false,
+            .st,
+        );
+    };
+    defer req.destroy();
+
+    try testing.expectEqual(
+        @as(usize, terminal.kitty.clipboard.max_write_aliases + 2),
+        req.contents.len,
+    );
+    try testing.expectEqualStrings("aliases", req.id);
+    try testing.expectEqualStrings("source", req.name);
+    try testing.expectEqualStrings("Ghostty", req.contents[0].data);
+    try testing.expectEqualStrings("PNG", req.contents[1].data);
+    try testing.expect(
+        req.contents[0].data.ptr != req.contents[1].data.ptr,
+    );
+    for (req.contents[2..]) |content| {
+        try testing.expectEqualStrings("Ghostty", content.data);
+        try testing.expectEqual(
+            @intFromPtr(req.contents[0].data.ptr),
+            @intFromPtr(content.data.ptr),
+        );
+    }
 }

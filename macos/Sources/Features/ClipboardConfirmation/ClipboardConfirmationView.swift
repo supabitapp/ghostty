@@ -81,7 +81,7 @@ struct ClipboardConfirmationView: View {
             }
 
             if canRemember {
-                Toggle("Remember this choice for the session", isOn: $remember)
+                Toggle("Allow for the rest of this terminal session", isOn: $remember)
                     .padding(.top, 4)
             }
 

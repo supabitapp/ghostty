@@ -34,6 +34,75 @@ struct NSPasteboardTypeExtensionTests {
     }
 }
 
+struct NSPasteboardGhosttyTests {
+    private func makePasteboard() -> NSPasteboard {
+        let pasteboard = NSPasteboard(
+            name: NSPasteboard.Name("test-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        return pasteboard
+    }
+
+    @Test func fileURLOnlyAdvertisesURIList() {
+        let pasteboard = makePasteboard()
+        let item = NSPasteboardItem()
+        item.setString("file:///Users/test/document.txt", forType: .fileURL)
+        pasteboard.writeObjects([item])
+
+        #expect(pasteboard.ghosttyAvailableMimes() == ["text/uri-list"])
+        #expect(pasteboard.ghosttyData(
+            forMime: "text/plain",
+            request: GHOSTTY_CLIPBOARD_REQUEST_KITTY_READ
+        ) == nil)
+        #expect(pasteboard.ghosttyData(
+            forMime: "text/uri-list",
+            request: GHOSTTY_CLIPBOARD_REQUEST_KITTY_READ
+        ).flatMap { String(data: $0, encoding: .utf8) } == "file:///Users/test/document.txt\r\n")
+    }
+
+    @Test func exactDeclaredPlainTextPrecedesMappedType() {
+        let pasteboard = makePasteboard()
+        let exact = NSPasteboard.PasteboardType("text/plain")
+        pasteboard.declareTypes([exact, .string], owner: nil)
+        pasteboard.setData(Data("exact".utf8), forType: exact)
+        pasteboard.setData(Data("mapped".utf8), forType: .string)
+
+        #expect(pasteboard.ghosttyAvailableMimes() == ["text/plain"])
+        #expect(pasteboard.ghosttyData(
+            forMime: "text/plain",
+            request: GHOSTTY_CLIPBOARD_REQUEST_KITTY_READ
+        ).flatMap { String(data: $0, encoding: .utf8) } == "exact")
+    }
+
+    @Test func mappedDeclaredPlainTextCanBeRead() {
+        let pasteboard = makePasteboard()
+        pasteboard.declareTypes([.string], owner: nil)
+        pasteboard.setData(Data("mapped".utf8), forType: .string)
+
+        #expect(pasteboard.ghosttyAvailableMimes() == ["text/plain"])
+        #expect(pasteboard.ghosttyData(
+            forMime: "text/plain",
+            request: GHOSTTY_CLIPBOARD_REQUEST_KITTY_READ
+        ).flatMap { String(data: $0, encoding: .utf8) } == "mapped")
+    }
+
+    @Test func aliasTypesShareOneLazyPasteboardItem() throws {
+        let pasteboard = makePasteboard()
+        let data = Data(repeating: 0x41, count: 64)
+
+        #expect(pasteboard.writeGhosttyContents([
+            Ghostty.ClipboardContent(mime: "text/plain", data: data),
+            Ghostty.ClipboardContent(mime: "text/html", data: data),
+        ]))
+
+        let item = try #require(pasteboard.pasteboardItems?.first)
+        #expect(pasteboard.pasteboardItems?.count == 1)
+        #expect(item.types.contains(.string))
+        #expect(item.types.contains(.html))
+        #expect(item.data(forType: .string) == data)
+        #expect(item.data(forType: .html) == data)
+    }
+}
+
 /// Tests for `NSPasteboard.getOpinionatedStringContents`, which per its documented
 /// semantics must, for each pasteboard item:
 /// - prefer the absolute filesystem path of a file URL, shell-escaped,

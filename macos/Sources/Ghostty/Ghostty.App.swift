@@ -367,18 +367,11 @@ extension Ghostty {
             // Copy the borrowed C representations: the confirmation is
             // asynchronous and completes with exactly what the user
             // approved, so the clipboard is never re-read.
-            var reps: [Ghostty.ClipboardContent] = []
-            if let contents = c.contents {
-                for i in 0..<c.contents_len {
-                    let content = contents[i]
-                    let data: Data = if content.len > 0 {
-                        Data(bytes: content.data, count: content.len)
-                    } else {
-                        Data()
-                    }
-                    reps.append(.init(mime: String(cString: content.mime), data: data))
-                }
-            }
+            let reps = c.contents.map {
+                Ghostty.ClipboardContent.from(
+                    contents: $0,
+                    count: c.contents_len)
+            } ?? []
             var avail: [String] = []
             if let available = c.available {
                 for i in 0..<c.available_len {
@@ -415,7 +408,7 @@ extension Ghostty {
                 if confirmed {
                     completeClipboardRequest(
                         surface,
-                        contents: reps,
+                        contents: completionContents(reps, for: kind),
                         available: avail,
                         state: state,
                         confirmed: true,
@@ -425,6 +418,13 @@ extension Ghostty {
                 }
             }
             surfaceView.pendingClipboardConfirmation = request
+        }
+
+        static func completionContents(
+            _ contents: [Ghostty.ClipboardContent],
+            for request: Ghostty.ClipboardRequest
+        ) -> [Ghostty.ClipboardContent] {
+            request == .kitty_write ? [] : contents
         }
 
         private static func completeClipboardRequest(
@@ -494,10 +494,9 @@ extension Ghostty {
             guard let pasteboard = NSPasteboard.ghostty(location) else { return false }
             guard let content = content, len > 0 else { return false }
 
-            // Convert the C array to Swift array
-            let contentArray = (0..<len).compactMap { i in
-                Ghostty.ClipboardContent.from(content: content[i])
-            }
+            let contentArray = Ghostty.ClipboardContent.from(
+                contents: content,
+                count: len)
             guard !contentArray.isEmpty else { return false }
 
             // Assert there is only one text/plain entry. For security reasons we need
@@ -508,18 +507,7 @@ extension Ghostty {
             if !confirm {
                 // Apply writes allowed by policy immediately. Only writes that
                 // require confirmation continue to the pending request below.
-                let values = contentArray.compactMap { item in
-                    NSPasteboard.PasteboardType(mimeType: item.mime).map { ($0, item.data) }
-                }
-                guard !values.isEmpty else { return false }
-                pasteboard.declareTypes(values.map(\.0), owner: nil)
-
-                // Set data for each type
-                var wroteAll = true
-                for (type, data) in values {
-                    wroteAll = pasteboard.setData(data, forType: type) && wroteAll
-                }
-                return wroteAll
+                return pasteboard.writeGhosttyContents(contentArray)
             }
 
             // For confirmation, use the text/plain content if it exists
@@ -534,8 +522,7 @@ extension Ghostty {
                 kind: .osc_52_write
             ) { _, confirmed, _ in
                 guard confirmed else { return }
-                pasteboard.declareTypes([.string], owner: nil)
-                pasteboard.setString(textPlainString, forType: .string)
+                _ = pasteboard.writeGhosttyContents([textPlainContent])
             }
             surfaceView.pendingClipboardConfirmation = request
             return true

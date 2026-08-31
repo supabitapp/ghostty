@@ -246,22 +246,47 @@ extension Ghostty {
         /// The data as text, if it is valid UTF-8.
         var string: String? { String(data: data, encoding: .utf8) }
 
-        static func from(content: ghostty_clipboard_content_s) -> ClipboardContent? {
-            guard let mimePtr = content.mime,
-                  let dataPtr = content.data else {
-                return nil
+        static func from(
+            contents: UnsafePointer<ghostty_clipboard_content_s>,
+            count: Int
+        ) -> [ClipboardContent] {
+            guard count >= 0 else { return [] }
+
+            struct Payload: Hashable {
+                let address: Int
+                let count: Int
             }
 
-            let data: Data = if content.len > 0 {
-                Data(bytes: dataPtr, count: content.len)
-            } else {
-                Data()
-            }
+            var dataByPayload: [Payload: Data] = [:]
+            return (0..<count).compactMap { index in
+                let content = contents[index]
+                guard let mime = content.mime,
+                      content.len >= 0,
+                      content.len == 0 || content.data != nil else { return nil }
 
-            return ClipboardContent(
-                mime: String(cString: mimePtr),
-                data: data
-            )
+                guard let data = content.data else {
+                    return ClipboardContent(
+                        mime: String(cString: mime),
+                        data: Data())
+                }
+
+                let payload = Payload(
+                    address: Int(bitPattern: data),
+                    count: content.len)
+                let ownedData: Data
+                if let existing = dataByPayload[payload] {
+                    ownedData = existing
+                } else {
+                    ownedData = content.len > 0
+                        ? Data(bytes: data, count: content.len)
+                        : Data()
+                    dataByPayload[payload] = ownedData
+                }
+
+                return ClipboardContent(
+                    mime: String(cString: mime),
+                    data: ownedData)
+            }
         }
     }
 
