@@ -8,6 +8,7 @@
 
 import Testing
 import AppKit
+import GhosttyKit
 @testable import Ghostty
 
 struct NSPasteboardTypeExtensionTests {
@@ -128,6 +129,24 @@ struct NSPasteboardOpinionatedContentsTests {
         pasteboard.writeObjects([item])
 
         #expect(pasteboard.getOpinionatedStringContents() == "/Users/test/document.txt")
+    }
+
+    @Test func testGhosttyPlainTextDataUsesReadKind() {
+        let pasteboard = makePasteboard()
+        let item = NSPasteboardItem()
+        item.setString("file:///Users/test/document.txt", forType: .fileURL)
+        item.setString("document.txt", forType: .string)
+        pasteboard.writeObjects([item])
+
+        let paste = pasteboard.ghosttyData(
+            forMime: "text/plain",
+            request: GHOSTTY_CLIPBOARD_REQUEST_PASTE)
+        let read = pasteboard.ghosttyData(
+            forMime: "text/plain",
+            request: GHOSTTY_CLIPBOARD_REQUEST_OSC_52_READ)
+
+        #expect(paste.flatMap { String(data: $0, encoding: .utf8) } == "/Users/test/document.txt")
+        #expect(read.flatMap { String(data: $0, encoding: .utf8) } == "document.txt")
     }
 
     @Test func testMixedFileURLAndStringItems() {

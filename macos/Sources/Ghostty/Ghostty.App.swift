@@ -60,11 +60,12 @@ extension Ghostty {
                 supports_selection_clipboard: true,
                 wakeup_cb: { userdata in App.wakeup(userdata) },
                 action_cb: { app, target, action in App.action(app!, target: target, action: action) },
-                read_clipboard_cb: { userdata, loc, state, mimes, mimesLen, list in
+                read_clipboard_cb: { userdata, loc, state, request, mimes, mimesLen, list in
                     App.readClipboard(
                         userdata,
                         location: loc,
                         state: state,
+                        request: request,
                         mimes: mimes,
                         mimesLen: mimesLen,
                         list: list) },
@@ -299,6 +300,7 @@ extension Ghostty {
             _ userdata: UnsafeMutableRawPointer?,
             location: ghostty_clipboard_e,
             state: UnsafeMutableRawPointer?,
+            request: ghostty_clipboard_request_e,
             mimes: UnsafePointer<UnsafePointer<CChar>?>?,
             mimesLen: Int,
             list: Bool
@@ -325,7 +327,7 @@ extension Ghostty {
                     let mime = String(cString: ptr)
                     guard !seen.contains(mime) else { continue }
                     seen.insert(mime)
-                    guard let data = pasteboard.ghosttyData(forMime: mime) else { continue }
+                    guard let data = pasteboard.ghosttyData(forMime: mime, request: request) else { continue }
                     contents.append(.init(mime: mime, data: data))
                 }
             }
@@ -487,16 +489,16 @@ extension Ghostty {
             content: UnsafePointer<ghostty_clipboard_content_s>?,
             len: Int,
             confirm: Bool
-        ) {
+        ) -> Bool {
             let surfaceView = self.surfaceUserdata(from: userdata)
-            guard let pasteboard = NSPasteboard.ghostty(location) else { return }
-            guard let content = content, len > 0 else { return }
+            guard let pasteboard = NSPasteboard.ghostty(location) else { return false }
+            guard let content = content, len > 0 else { return false }
 
             // Convert the C array to Swift array
             let contentArray = (0..<len).compactMap { i in
                 Ghostty.ClipboardContent.from(content: content[i])
             }
-            guard !contentArray.isEmpty else { return }
+            guard !contentArray.isEmpty else { return false }
 
             // Assert there is only one text/plain entry. For security reasons we need
             // to guarantee this for now since our confirmation dialog only shows one.
@@ -509,20 +511,22 @@ extension Ghostty {
                 let types = contentArray.compactMap { item in
                     NSPasteboard.PasteboardType(mimeType: item.mime)
                 }
+                guard !types.isEmpty else { return false }
                 pasteboard.declareTypes(types, owner: nil)
 
                 // Set data for each type
+                var wroteAll = true
                 for item in contentArray {
                     guard let type = NSPasteboard.PasteboardType(mimeType: item.mime) else { continue }
-                    pasteboard.setData(item.data, forType: type)
+                    wroteAll = pasteboard.setData(item.data, forType: type) && wroteAll
                 }
-                return
+                return wroteAll
             }
 
             // For confirmation, use the text/plain content if it exists
             guard let textPlainContent = contentArray.first(where: { $0.mime == "text/plain" }),
                   let textPlainString = textPlainContent.string else {
-                return
+                return false
             }
 
             let request = Ghostty.ClipboardConfirmationRequest(
@@ -535,6 +539,7 @@ extension Ghostty {
                 pasteboard.setString(textPlainString, forType: .string)
             }
             surfaceView.pendingClipboardConfirmation = request
+            return true
         }
 
         static func wakeup(_ userdata: UnsafeMutableRawPointer?) {

@@ -65,18 +65,14 @@ extension NSPasteboard {
     }
 
     /// The data for the given MIME type, if the pasteboard can serve it.
-    ///
-    /// The canonical "text/plain" type uses the opinionated string
-    /// contents so that e.g. copying a file yields its escaped path;
-    /// this matches what pasting into the terminal produces. Copied
-    /// files are additionally served as "text/uri-list" (RFC 2483, the
-    /// type X11/Wayland clipboards carry file copies under). All other
-    /// types are mapped through UTType.
-    func ghosttyData(forMime mime: String) -> Data? {
+    func ghosttyData(forMime mime: String, request: ghostty_clipboard_request_e) -> Data? {
         switch mime {
-        case "text/plain":
+        case "text/plain" where request == GHOSTTY_CLIPBOARD_REQUEST_PASTE:
             guard let str = getOpinionatedStringContents() else { return nil }
             return Data(str.utf8)
+
+        case "text/plain":
+            return data(forType: .string)
 
         case "text/uri-list":
             let urls = ghosttyFileURLs
