@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
 const fastprint = @import("../fastprint.zig");
+const simd = @import("../simd/main.zig");
 const lib = @import("lib.zig");
 const Allocator = std.mem.Allocator;
 const color = @import("color.zig");
@@ -1628,9 +1629,44 @@ pub const PageFormatter = struct {
         var pending: usize = blank_cells.*;
 
         var i: usize = 0;
+        ascii: {
+            if (comptime emit != .plain) break :ascii;
+            if (track_points or self.opts.trim or pending != 0) break :ascii;
+            if (simd.lanes(Cell.Backing)) |lanes| {
+                const Group = @Vector(lanes, Cell.Backing);
+                const content_tag_mask = std.math.maxInt(
+                    std.meta.Int(.unsigned, @bitSizeOf(Cell.ContentTag)),
+                );
+                const wide_mask = std.math.maxInt(
+                    std.meta.Int(.unsigned, @bitSizeOf(Cell.Wide)),
+                );
+                const structure_mask: Cell.Backing = content_tag_mask |
+                    (@as(Cell.Backing, wide_mask) << @bitOffsetOf(Cell, "wide"));
+                const Shift = @Vector(lanes, std.math.Log2Int(Cell.Backing));
+                const shift: Shift = @splat(@intCast(@bitOffsetOf(Cell, "content")));
+                while (cells.len - i >= lanes) : (i += lanes) {
+                    const raw: Group = @bitCast(cells[i..][0..lanes].*);
+                    const codepoints = (raw >> shift) &
+                        @as(Group, @splat(std.math.maxInt(u21)));
+                    if (@reduce(.Or, raw & @as(Group, @splat(structure_mask))) != 0 or
+                        @reduce(.Or, codepoints == @as(Group, @splat(0))) or
+                        @reduce(.Or, codepoints > @as(Group, @splat(0x7F))))
+                    {
+                        break;
+                    }
+                    if (len + lanes > buf.len) {
+                        try writer.writeAll(buf[0..len]);
+                        len = 0;
+                    }
+                    const bytes: @Vector(lanes, u8) = @truncate(codepoints);
+                    buf[len..][0..lanes].* = @bitCast(bytes);
+                    len += lanes;
+                }
+            }
+        }
+
         while (i < cells.len) : (i += 1) {
             const cell = &cells[i];
-
             // Spacers produce no output, matching the slow path which
             // skips them before any blank/style handling.
             switch (cell.wide) {
