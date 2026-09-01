@@ -2932,18 +2932,32 @@ pub const SelectionString = struct {
 
 const SuffixWriter = struct {
     writer: std.Io.Writer,
+    alloc: Allocator,
+    maximum_bytes: usize,
     storage: []u8,
+    storage_owned: bool = false,
+    allocation_error: ?Allocator.Error = null,
     start: usize = 0,
     len: usize = 0,
 
-    fn init(storage: []u8) SuffixWriter {
+    fn init(
+        alloc: Allocator,
+        maximum_bytes: usize,
+        scratch: []u8,
+    ) SuffixWriter {
         return .{
             .writer = .{
                 .buffer = &.{},
                 .vtable = &.{ .drain = drain },
             },
-            .storage = storage,
+            .alloc = alloc,
+            .maximum_bytes = maximum_bytes,
+            .storage = scratch[0..@min(scratch.len, maximum_bytes)],
         };
+    }
+
+    fn deinit(self: *SuffixWriter) void {
+        if (self.storage_owned) self.alloc.free(self.storage);
     }
 
     fn drain(
@@ -2954,18 +2968,34 @@ const SuffixWriter = struct {
         const self: *SuffixWriter = @fieldParentPtr("writer", writer);
         var written: usize = 0;
         for (data[0 .. data.len - 1]) |bytes| {
-            self.append(bytes);
+            self.append(bytes) catch |err| {
+                self.allocation_error = err;
+                return error.WriteFailed;
+            };
             written += bytes.len;
         }
         for (0..splat) |_| {
             const bytes = data[data.len - 1];
-            self.append(bytes);
+            self.append(bytes) catch |err| {
+                self.allocation_error = err;
+                return error.WriteFailed;
+            };
             written += bytes.len;
         }
         return written;
     }
 
-    fn append(self: *SuffixWriter, bytes: []const u8) void {
+    fn append(self: *SuffixWriter, bytes: []const u8) Allocator.Error!void {
+        if (!self.storage_owned and
+            self.maximum_bytes > self.storage.len and
+            bytes.len > self.storage.len - self.len)
+        {
+            const storage = try self.alloc.alloc(u8, self.maximum_bytes);
+            @memcpy(storage[0..self.len], self.storage[0..self.len]);
+            self.storage = storage;
+            self.storage_owned = true;
+        }
+
         const capacity = self.storage.len;
         if (capacity == 0 or bytes.len == 0) return;
         if (bytes.len >= capacity) {
@@ -2997,60 +3027,31 @@ const SuffixWriter = struct {
         self.start = (self.start + remaining.len) % capacity;
     }
 
-    fn finish(self: *SuffixWriter) []u8 {
+    fn take(self: *SuffixWriter) Allocator.Error![:0]u8 {
         if (self.start > 0) {
             std.mem.rotate(u8, self.storage[0..self.len], self.start);
         }
-        return self.storage[0..self.len];
-    }
-};
 
-const UTF8SuffixStartWriter = struct {
-    writer: std.Io.Writer,
-    candidate: usize,
-    offset: usize = 0,
-    start: ?usize = null,
+        var start: usize = 0;
+        while (start < self.len and self.storage[start] & 0xC0 == 0x80) start += 1;
+        const payload_len = self.len - start;
 
-    fn init(candidate: usize) UTF8SuffixStartWriter {
-        return .{
-            .writer = .{
-                .buffer = &.{},
-                .vtable = &.{ .drain = drain },
-            },
-            .candidate = candidate,
+        const allocation: []u8 = if (self.storage_owned) allocation: {
+            if (start > 0) std.mem.copyForwards(
+                u8,
+                self.storage[0..payload_len],
+                self.storage[start..self.len],
+            );
+            const allocation = try self.alloc.realloc(self.storage, payload_len + 1);
+            self.storage_owned = false;
+            break :allocation allocation;
+        } else allocation: {
+            const allocation = try self.alloc.alloc(u8, payload_len + 1);
+            @memcpy(allocation[0..payload_len], self.storage[start..self.len]);
+            break :allocation allocation;
         };
-    }
-
-    fn drain(
-        writer: *std.Io.Writer,
-        data: []const []const u8,
-        splat: usize,
-    ) std.Io.Writer.Error!usize {
-        const self: *UTF8SuffixStartWriter = @fieldParentPtr("writer", writer);
-        var written: usize = 0;
-        for (data[0 .. data.len - 1]) |bytes| {
-            self.scan(bytes);
-            written += bytes.len;
-        }
-        for (0..splat) |_| {
-            const bytes = data[data.len - 1];
-            self.scan(bytes);
-            written += bytes.len;
-        }
-        return written;
-    }
-
-    fn scan(self: *UTF8SuffixStartWriter, bytes: []const u8) void {
-        if (self.start == null and self.offset + bytes.len > self.candidate) {
-            const first = self.candidate -| self.offset;
-            for (bytes[first..], first..) |byte, index| {
-                if (byte & 0xC0 != 0x80) {
-                    self.start = self.offset + index;
-                    break;
-                }
-            }
-        }
-        self.offset += bytes.len;
+        allocation[payload_len] = 0;
+        return allocation[0..payload_len :0];
     }
 };
 
@@ -3131,34 +3132,14 @@ pub fn selectionStringSuffix(
     sel: Selection,
     maximum_bytes: usize,
 ) Allocator.Error![:0]const u8 {
-    var discarding: std.Io.Writer.Discarding = .init(&.{});
-    var formatter = self.selectionFormatter(sel, false);
-    formatter.format(&discarding.writer) catch unreachable;
-
-    const total_len = std.math.cast(usize, discarding.fullCount()) orelse
-        return error.OutOfMemory;
-    const candidate = total_len - @min(total_len, maximum_bytes);
-    const suffix_start: usize = if (candidate == 0 or candidate == total_len)
-        candidate
-    else suffix_start: {
-        var boundary: UTF8SuffixStartWriter = .init(candidate);
-        formatter = self.selectionFormatter(sel, false);
-        formatter.format(&boundary.writer) catch unreachable;
-        break :suffix_start boundary.start orelse total_len;
+    var scratch: [4096]u8 = undefined;
+    var suffix: SuffixWriter = .init(alloc, maximum_bytes, &scratch);
+    defer suffix.deinit();
+    const formatter = self.selectionFormatter(sel, false);
+    formatter.format(&suffix.writer) catch {
+        return suffix.allocation_error orelse unreachable;
     };
-    const payload_len = total_len - suffix_start;
-    const allocation_len = std.math.add(usize, payload_len, 1) catch
-        return error.OutOfMemory;
-    const allocation = try alloc.alloc(u8, allocation_len);
-    errdefer alloc.free(allocation);
-
-    var suffix: SuffixWriter = .init(allocation[0..payload_len]);
-    formatter = self.selectionFormatter(sel, false);
-    formatter.format(&suffix.writer) catch unreachable;
-    const text = suffix.finish();
-    assert(text.len == payload_len);
-    allocation[text.len] = 0;
-    return allocation[0..text.len :0];
+    return suffix.take();
 }
 
 pub const SelectLine = struct {
@@ -11045,6 +11026,29 @@ test "Screen: selectionStringSuffix preserves whitespace and soft wraps" {
     const contents = try s.selectionStringSuffix(alloc, sel, 13);
     defer alloc.free(contents);
     try testing.expectEqualStrings("  \n2EFGH3IJKL", contents);
+}
+
+test "Screen: selectionStringSuffix exceeds scratch capacity" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 80, .rows = 80, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    var ascii: [5600]u8 = @splat('A');
+    try s.testWriteString(&ascii);
+    try s.testWriteString("🙂Z");
+
+    const sel = Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 72, .y = 70 } }).?,
+        false,
+    );
+    const contents = try s.selectionStringSuffix(alloc, sel, 4097);
+    defer alloc.free(contents);
+    try testing.expectEqual(4097, contents.len);
+    try testing.expectEqualStrings("🙂Z", contents[contents.len - 5 ..]);
+    for (contents[0 .. contents.len - 5]) |byte| try testing.expectEqual('A', byte);
 }
 
 test "Screen: selectionString wide char" {

@@ -86,6 +86,8 @@ pub const Options = struct {
     /// when the content is too small for stable hyperfine measurements.
     loops: u32 = 25,
 
+    @"maximum-bytes": usize = 64 * 1024,
+
     /// The size of the terminal. This affects wrapping and page sizes.
     @"terminal-rows": u16 = 24,
     @"terminal-cols": u16 = 80,
@@ -111,6 +113,8 @@ pub const Mode = enum {
 
     /// Print content and output sizes. Not a timing benchmark.
     report,
+
+    suffix,
 
     /// Semantic verification, not a timing benchmark: format the
     /// terminal (must be `--emit=vt`), feed the output into a fresh
@@ -173,6 +177,7 @@ pub fn benchmark(self: *TerminalFormatter) Benchmark {
             .noop => stepNoop,
             .format => stepFormat,
             .report => stepReport,
+            .suffix => stepSuffix,
             .roundtrip => stepRoundtrip,
         },
         .setupFn = setup,
@@ -281,6 +286,32 @@ fn stepFormat(ptr: *anyopaque) Benchmark.Error!void {
             return error.BenchmarkFailed;
         };
         std.mem.doNotOptimizeAway(self.output.written());
+    }
+}
+
+fn stepSuffix(ptr: *anyopaque) Benchmark.Error!void {
+    const self: *TerminalFormatter = @ptrCast(@alignCast(ptr));
+    const screen = self.terminal.?.screens.active;
+    const tag: terminalpkg.point.Tag = switch (self.opts.region) {
+        .screen => .screen,
+        .active => .active,
+        .history => .history,
+    };
+    const top_left = screen.pages.getTopLeft(tag);
+    const bottom_right = screen.pages.getBottomRight(tag) orelse return;
+    const selection = Selection.init(top_left, bottom_right, false);
+
+    for (0..self.opts.loops) |_| {
+        const text = screen.selectionStringSuffix(
+            self.alloc,
+            selection,
+            self.opts.@"maximum-bytes",
+        ) catch |err| {
+            log.warn("suffix formatting failed err={}", .{err});
+            return error.BenchmarkFailed;
+        };
+        std.mem.doNotOptimizeAway(text);
+        self.alloc.free(text);
     }
 }
 
@@ -471,6 +502,21 @@ test "TerminalFormatter pin map" {
     const testing = std.testing;
     const impl: *TerminalFormatter = try .create(testing.allocator, .{
         .@"pin-map" = true,
+        .loops = 1,
+        .@"terminal-rows" = 4,
+        .@"terminal-cols" = 8,
+    });
+    defer impl.destroy(testing.allocator);
+
+    const bench = impl.benchmark();
+    _ = try bench.run(.once);
+}
+
+test "TerminalFormatter suffix" {
+    const testing = std.testing;
+    const impl: *TerminalFormatter = try .create(testing.allocator, .{
+        .mode = .suffix,
+        .region = .active,
         .loops = 1,
         .@"terminal-rows" = 4,
         .@"terminal-cols" = 8,
