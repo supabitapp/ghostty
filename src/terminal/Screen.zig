@@ -2936,7 +2936,6 @@ const SuffixWriter = struct {
     maximum_bytes: usize,
     storage: []u8,
     storage_owned: bool = false,
-    allocation_error: ?Allocator.Error = null,
     start: usize = 0,
     len: usize = 0,
 
@@ -2968,21 +2967,22 @@ const SuffixWriter = struct {
         const self: *SuffixWriter = @fieldParentPtr("writer", writer);
         var written: usize = 0;
         for (data[0 .. data.len - 1]) |bytes| {
-            self.append(bytes) catch |err| {
-                self.allocation_error = err;
-                return error.WriteFailed;
-            };
+            try self.appendForWriter(bytes);
             written += bytes.len;
         }
         for (0..splat) |_| {
             const bytes = data[data.len - 1];
-            self.append(bytes) catch |err| {
-                self.allocation_error = err;
-                return error.WriteFailed;
-            };
+            try self.appendForWriter(bytes);
             written += bytes.len;
         }
         return written;
+    }
+
+    fn appendForWriter(
+        self: *SuffixWriter,
+        bytes: []const u8,
+    ) std.Io.Writer.Error!void {
+        self.append(bytes) catch return error.WriteFailed;
     }
 
     fn append(self: *SuffixWriter, bytes: []const u8) Allocator.Error!void {
@@ -3035,6 +3035,8 @@ const SuffixWriter = struct {
         var start: usize = 0;
         while (start < self.len and self.storage[start] & 0xC0 == 0x80) start += 1;
         const payload_len = self.len - start;
+        const allocation_len = std.math.add(usize, payload_len, 1) catch
+            return error.OutOfMemory;
 
         const allocation: []u8 = if (self.storage_owned) allocation: {
             if (start > 0) std.mem.copyForwards(
@@ -3042,11 +3044,11 @@ const SuffixWriter = struct {
                 self.storage[0..payload_len],
                 self.storage[start..self.len],
             );
-            const allocation = try self.alloc.realloc(self.storage, payload_len + 1);
+            const allocation = try self.alloc.realloc(self.storage, allocation_len);
             self.storage_owned = false;
             break :allocation allocation;
         } else allocation: {
-            const allocation = try self.alloc.alloc(u8, payload_len + 1);
+            const allocation = try self.alloc.alloc(u8, allocation_len);
             @memcpy(allocation[0..payload_len], self.storage[start..self.len]);
             break :allocation allocation;
         };
@@ -3136,9 +3138,7 @@ pub fn selectionStringSuffix(
     var suffix: SuffixWriter = .init(alloc, maximum_bytes, &scratch);
     defer suffix.deinit();
     const formatter = self.selectionFormatter(sel, false);
-    formatter.format(&suffix.writer) catch {
-        return suffix.allocation_error orelse unreachable;
-    };
+    formatter.format(&suffix.writer) catch return error.OutOfMemory;
     return suffix.take();
 }
 
