@@ -554,6 +554,7 @@ pub fn encode(
     // Validate both handles and preflight the terminal continuation.
     const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     if (writer.write == null) return .invalid_value;
+    if (!terminal_c.snapshotSafe(terminal)) return .rejected;
     const continuation = continuationOwned(terminal);
     if (continuation.result != .success) return continuation.result;
     defer native.gpa().free(continuation.bytes);
@@ -585,6 +586,7 @@ pub fn encode_buf(
     out_written.* = 0;
     if (buf == null and buf_len != 0) return .invalid_value;
     const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
+    if (!terminal_c.snapshotSafe(terminal)) return .rejected;
     const continuation = continuationOwned(terminal);
     if (continuation.result != .success) return continuation.result;
     defer native.gpa().free(continuation.bytes);
@@ -634,6 +636,7 @@ pub fn encode_alloc(
 
     // Preflight continuation state before building an allocating writer.
     const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
+    if (!terminal_c.snapshotSafe(terminal)) return .rejected;
     const continuation = continuationOwned(terminal);
     if (continuation.result != .success) return continuation.result;
     defer native.gpa().free(continuation.bytes);
@@ -669,6 +672,7 @@ fn mapEncodeError(
     // Fixed and allocating writers surface only core allocation or size errors.
     return switch (err) {
         error.OutOfMemory, error.WriteFailed => .out_of_memory,
+        error.UnsupportedState => .rejected,
         error.Overflow,
         error.PayloadTooLarge,
         error.PageCountOverflow,
@@ -758,6 +762,78 @@ test "decoder option and empty source" {
         &terminal,
     ));
     try testing.expectEqual(null, terminal);
+}
+
+test "snapshot C API rejects persistent clipboard handler state before output" {
+    const S = struct {
+        var writer_calls: usize = 0;
+
+        fn write(
+            _: ?*anyopaque,
+            _: [*]const u8,
+            _: usize,
+        ) callconv(lib.calling_conv) bool {
+            writer_calls += 1;
+            return true;
+        }
+
+        fn clipboardWrite(
+            _: terminal_c.Terminal,
+            _: ?*anyopaque,
+            request: *const terminal_c.ClipboardWrite,
+        ) callconv(lib.calling_conv) void {
+            request.reply(request, &.{
+                .size = @sizeOf(terminal_c.ClipboardWriteReply),
+                .result = .success,
+                .remember = true,
+            });
+        }
+    };
+
+    var source: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &source,
+        20,
+        4,
+    ));
+    defer terminal_c.free(source);
+    try testing.expectEqual(Result.success, terminal_c.set(
+        source,
+        .clipboard_write,
+        @ptrCast(&S.clipboardWrite),
+    ));
+
+    const begin = "\x1B]5522;type=write:pw=c2VjcmV0:name=YXBw\x1B\\";
+    terminal_c.vt_write(source, begin, begin.len);
+
+    var fixed: [32]u8 = @splat(0xA5);
+    var written: usize = 99;
+    try testing.expectEqual(Result.rejected, encode_buf(
+        source,
+        &fixed,
+        fixed.len,
+        &written,
+    ));
+    try testing.expectEqual(@as(usize, 0), written);
+    try testing.expectEqualSlices(u8, &([_]u8{0xA5} ** fixed.len), &fixed);
+
+    S.writer_calls = 0;
+    try testing.expectEqual(Result.rejected, encode(source, .{
+        .write = S.write,
+    }));
+    try testing.expectEqual(@as(usize, 0), S.writer_calls);
+
+    const commit = "\x1B]5522;type=wdata\x1B\\";
+    terminal_c.vt_write(source, commit, commit.len);
+    written = 99;
+    try testing.expectEqual(Result.rejected, encode_buf(
+        source,
+        &fixed,
+        fixed.len,
+        &written,
+    ));
+    try testing.expectEqual(@as(usize, 0), written);
 }
 
 test "snapshot C API full round trip restores continuation" {

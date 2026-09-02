@@ -326,7 +326,10 @@ fn drainMailbox(
             .inspector => |v| self.flags.has_inspector = v,
             .resize => |v| self.handleResize(cb, v),
             .size_report => |v| try io.sizeReport(data, v),
-            .clear_screen => |v| try io.clearScreen(data, v.history),
+            .clear_screen => |v| io.clearScreen(data, v.history) catch |err| switch (err) {
+                error.InputRejected, error.InputTooLarge => {},
+                else => return err,
+            },
             .scroll_viewport => |v| io.scrollViewport(v),
             .selection_scroll => |v| {
                 if (v) {
@@ -347,22 +350,52 @@ fn drainMailbox(
             .start_synchronized_output => self.startSynchronizedOutput(cb),
             .linefeed_mode => |v| self.flags.linefeed_mode = v,
             .focused => |v| try io.focusGained(data, v),
-            .write_small => |v| try io.queueWrite(
+            .write_small => |v| try handleWrite(
+                io,
                 data,
                 v.data[0..v.len],
                 self.flags.linefeed_mode,
+                .user_input,
             ),
-            .write_stable => |v| try io.queueWrite(
+            .write_stable => |v| try handleWrite(
+                io,
                 data,
                 v,
                 self.flags.linefeed_mode,
+                .user_input,
             ),
             .write_alloc => |v| {
                 defer v.alloc.free(v.data);
-                try io.queueWrite(
+                try handleWrite(
+                    io,
                     data,
                     v.data,
                     self.flags.linefeed_mode,
+                    .user_input,
+                );
+            },
+            .terminal_reply_small => |v| try handleWrite(
+                io,
+                data,
+                v.data[0..v.len],
+                false,
+                .terminal_reply,
+            ),
+            .terminal_reply_stable => |v| try handleWrite(
+                io,
+                data,
+                v,
+                false,
+                .terminal_reply,
+            ),
+            .terminal_reply_alloc => |v| {
+                defer v.alloc.free(v.data);
+                try handleWrite(
+                    io,
+                    data,
+                    v.data,
+                    false,
+                    .terminal_reply,
                 );
             },
         }
@@ -373,6 +406,19 @@ fn drainMailbox(
     if (redraw) {
         try io.renderer_wakeup.notify();
     }
+}
+
+fn handleWrite(
+    io: *termio.Termio,
+    data: *termio.Termio.ThreadData,
+    bytes: []const u8,
+    linefeed: bool,
+    source: termio.WriteSource,
+) !void {
+    io.queueWrite(data, bytes, linefeed, source) catch |err| switch (err) {
+        error.InputRejected, error.InputTooLarge => return,
+        else => return err,
+    };
 }
 
 fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {

@@ -61,6 +61,7 @@ typedef SSIZE_T ssize_t;
 typedef void* ghostty_app_t;
 typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
+typedef void* ghostty_surface_snapshot_t;
 typedef void* ghostty_inspector_t;
 
 // All the types below are fully defined and must be kept in sync with
@@ -505,6 +506,14 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+typedef bool (*ghostty_surface_host_input_cb)(void*, const uint8_t*, size_t);
+typedef void (*ghostty_surface_host_input_rejected_cb)(void*, size_t);
+typedef void (*ghostty_surface_host_resize_cb)(void*,
+                                               uint16_t,
+                                               uint16_t,
+                                               uint32_t,
+                                               uint32_t);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -522,6 +531,12 @@ typedef struct {
   ghostty_surface_context_e context;
   const char* const* command_wrapper;
   size_t command_wrapper_count;
+  bool host_managed;
+  void* host_userdata;
+  ghostty_surface_host_input_cb host_input;
+  ghostty_surface_host_resize_cb host_resize;
+  size_t host_input_capacity;
+  ghostty_surface_host_input_rejected_cb host_input_rejected;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1183,6 +1198,19 @@ GHOSTTY_API void ghostty_surface_inherited_config_free(ghostty_surface_t, ghostt
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_write_buffer(ghostty_surface_t,
+                                                 const uint8_t*,
+                                                 size_t);
+GHOSTTY_API ghostty_surface_snapshot_t ghostty_surface_prepare_snapshot(
+    ghostty_surface_t,
+    const uint8_t*,
+    size_t);
+GHOSTTY_API bool ghostty_surface_commit_snapshot(ghostty_surface_t,
+                                                 ghostty_surface_snapshot_t);
+GHOSTTY_API void ghostty_surface_snapshot_free(ghostty_surface_snapshot_t);
+GHOSTTY_API bool ghostty_surface_restore_snapshot(ghostty_surface_t,
+                                                     const uint8_t*,
+                                                     size_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);

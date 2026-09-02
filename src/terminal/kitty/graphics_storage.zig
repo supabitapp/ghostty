@@ -70,6 +70,9 @@ const GenerationCounter = if (@bitSizeOf(usize) >= 64) struct {
 /// screen, alt screen) and contains all the transmitted images and
 /// placements.
 pub const ImageStorage = struct {
+    pub const initial_image_id: u32 = 2147483647;
+    pub const initial_internal_placement_id: u32 = 0;
+
     const ImageMap = std.AutoHashMapUnmanaged(u32, Image);
     const PlacementMap = std.AutoHashMapUnmanaged(PlacementKey, Placement);
 
@@ -107,13 +110,13 @@ pub const ImageStorage = struct {
     /// transmitted without an ID or number. We start mid-way through
     /// the u32 range to stay clear of the low IDs client programs
     /// typically pick. See nextImageId.
-    next_image_id: u32 = 2147483647,
+    next_image_id: u32 = initial_image_id,
 
     /// This is the next automatically assigned placement ID. This is never
     /// user-facing so we can start at 0. This is 32-bits because we use
     /// the same space for external placement IDs. We can start at zero
     /// because any number is valid.
-    next_internal_placement_id: u32 = 0,
+    next_internal_placement_id: u32 = initial_internal_placement_id,
 
     /// The set of images that are currently known.
     images: ImageMap = .{},

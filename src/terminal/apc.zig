@@ -12,6 +12,7 @@ const log = std.log.scoped(.terminal_apc);
 /// apcStart, apcPut, and apcEnd functions, respectively.
 pub const Handler = struct {
     state: State = .inactive,
+    failed: bool = false,
 
     /// Maximum content bytes retained for unsupported APC identifiers. Zero
     /// drops and ignores unknown APC values.
@@ -37,6 +38,7 @@ pub const Handler = struct {
     pub fn start(self: *Handler) void {
         self.state.deinit();
         self.state = .{ .identify = .{} };
+        self.failed = false;
     }
 
     /// Enable or disable APC protocol recognition for future APC sequences.
@@ -125,6 +127,7 @@ pub const Handler = struct {
 
             .kitty => |*p| if (comptime build_options.kitty_graphics) {
                 p.feed(byte) catch |err| {
+                    self.failed = true;
                     log.warn("kitty graphics protocol error: {}", .{err});
                     p.deinit();
                     self.state = .ignore;
@@ -133,6 +136,7 @@ pub const Handler = struct {
 
             .glyph => |*p| if (comptime build_options.glyph_protocol) {
                 p.feed(byte) catch |err| {
+                    self.failed = true;
                     log.warn("glyph protocol error: {}", .{err});
                     p.deinit();
                     self.state = .ignore;
@@ -190,6 +194,7 @@ pub const Handler = struct {
 
                 .kitty => |*p| if (comptime build_options.kitty_graphics) {
                     p.feedSlice(rem) catch |err| {
+                        self.failed = true;
                         log.warn("kitty graphics protocol error: {}", .{err});
                         p.deinit();
                         self.state = .ignore;
@@ -199,6 +204,7 @@ pub const Handler = struct {
 
                 .glyph => |*p| if (comptime build_options.glyph_protocol) {
                     p.feedSlice(rem) catch |err| {
+                        self.failed = true;
                         log.warn("glyph protocol error: {}", .{err});
                         p.deinit();
                         self.state = .ignore;
@@ -227,6 +233,7 @@ pub const Handler = struct {
                 // Use the same allocator that was used to create the parser.
                 const alloc = p.alloc;
                 const command = p.complete(alloc) catch |err| {
+                    self.failed = true;
                     log.warn("kitty graphics protocol error: {}", .{err});
                     break :kitty null;
                 };
@@ -238,6 +245,7 @@ pub const Handler = struct {
                 if (comptime !build_options.glyph_protocol) unreachable;
 
                 const command = p.complete(p.alloc) catch |err| {
+                    self.failed = true;
                     log.warn("glyph protocol error: {}", .{err});
                     break :glyph_cmd null;
                 };

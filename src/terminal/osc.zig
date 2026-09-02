@@ -334,6 +334,8 @@ pub const Parser = struct {
     /// The command that is the result of parsing.
     command: Command,
 
+    failed: bool,
+
     pub const State = enum {
         start,
         invalid,
@@ -397,6 +399,7 @@ pub const Parser = struct {
             .state = .start,
             .capture = null,
             .command = .invalid,
+            .failed = false,
 
             // Keeping all our undefined values together so we can
             // visually easily duplicate them in the Valgrind check below.
@@ -460,6 +463,7 @@ pub const Parser = struct {
         self.state = .start;
         self.capture = null;
         self.command = .invalid;
+        self.failed = false;
 
         if (std.valgrind.runningOnValgrind() > 0) {
             // Initialize our undefined fields so Valgrind can catch it.
@@ -518,8 +522,8 @@ pub const Parser = struct {
         /// Append one byte without permitting the backing allocation to grow
         /// beyond max_bytes. Allocating.Writer normally grows super-linearly,
         /// so grow it explicitly to keep the allocation itself bounded too.
-        pub inline fn writeByte(self: *Capture, byte: u8) error{WriteFailed}!void {
-            if (self.writer.buffered().len >= self.max_bytes) return error.WriteFailed;
+        pub inline fn writeByte(self: *Capture, byte: u8) error{ OutOfMemory, LimitExceeded }!void {
+            if (self.writer.buffered().len >= self.max_bytes) return error.LimitExceeded;
 
             switch (self.backing) {
                 .fixed => {},
@@ -532,12 +536,12 @@ pub const Parser = struct {
                         w.writer.buffer = w.allocator.realloc(
                             w.writer.buffer,
                             new_capacity,
-                        ) catch return error.WriteFailed;
+                        ) catch return error.OutOfMemory;
                     }
                 },
             }
 
-            try self.writer.writeByte(byte);
+            self.writer.writeByte(byte) catch return error.LimitExceeded;
         }
 
         /// Append a slice without permitting the backing allocation to
@@ -548,7 +552,7 @@ pub const Parser = struct {
         pub fn writeSlice(
             self: *Capture,
             bytes: []const u8,
-        ) error{WriteFailed}!void {
+        ) error{ OutOfMemory, LimitExceeded }!void {
             const avail = self.max_bytes - self.writer.buffered().len;
             const n = @min(bytes.len, avail);
 
@@ -564,13 +568,13 @@ pub const Parser = struct {
                         w.writer.buffer = w.allocator.realloc(
                             w.writer.buffer,
                             new_capacity,
-                        ) catch return error.WriteFailed;
+                        ) catch return error.OutOfMemory;
                     }
                 },
             }
 
-            try self.writer.writeAll(bytes[0..n]);
-            if (n < bytes.len) return error.WriteFailed;
+            self.writer.writeAll(bytes[0..n]) catch return error.LimitExceeded;
+            if (n < bytes.len) return error.LimitExceeded;
         }
 
         pub fn deinit(self: *Capture) void {
@@ -618,6 +622,7 @@ pub const Parser = struct {
                     alloc,
                     self.max_allocating_bytes,
                 ) catch {
+                    self.failed = true;
                     // The allocator failed for some reason, fall back to a fixed buffer
                     // and hope that it's big enough.
                     self.captureTrailing(.fixed);
@@ -647,10 +652,9 @@ pub const Parser = struct {
 
         const rem = input[offset..];
         if (rem.len == 0) return;
-        self.capture.?.writeSlice(rem) catch |err| switch (err) {
-            // We have overflowed our buffer or had some other error, set
-            // the state to invalid so that we discard any further input.
-            error.WriteFailed => self.state = .invalid,
+        self.capture.?.writeSlice(rem) catch |err| {
+            if (err == error.OutOfMemory) self.failed = true;
+            self.state = .invalid;
         };
     }
 
@@ -663,10 +667,9 @@ pub const Parser = struct {
         // If a writer has been initialized, we just accumulate the rest of the
         // OSC sequence in the writer's buffer and skip the state machine.
         if (self.capture) |*cap| {
-            cap.writeByte(c) catch |err| switch (err) {
-                // We have overflowed our buffer or had some other error, set the
-                // state to invalid so that we discard any further input.
-                error.WriteFailed => self.state = .invalid,
+            cap.writeByte(c) catch |err| {
+                if (err == error.OutOfMemory) self.failed = true;
+                self.state = .invalid;
             };
             return;
         }

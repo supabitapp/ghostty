@@ -202,6 +202,7 @@ pub const InputEffect = enum {
 
 pub const ProcessConfig = struct {
     command_wrapper: []const [*:0]const u8 = &.{},
+    host_managed: ?termio.HostManaged = null,
 };
 
 /// The search state for the surface.
@@ -260,6 +261,118 @@ const Mouse = struct {
     /// Return the left-click pin only if it still belongs to the active screen.
     fn activeLeftClickPin(self: *const Mouse, screens: *const terminal.ScreenSet) ?*terminal.Pin {
         return self.selection_gesture.validatedLeftClickPin(screens);
+    }
+};
+
+const SnapshotTransientState = struct {
+    const ReconcileState = struct {
+        alloc: Allocator,
+        title: ?[:0]u8,
+        pwd: [:0]u8,
+        mouse_shape: terminal.MouseShape,
+        secure_input: bool,
+        stop_selection_scroll: bool = false,
+
+        fn deinit(self: *ReconcileState) void {
+            if (self.title) |value| self.alloc.free(value);
+            self.alloc.free(self.pwd);
+            self.alloc.destroy(self);
+        }
+    };
+
+    surface: *Surface,
+    reconcile_state: ?*ReconcileState = null,
+
+    fn deinit(self: *SnapshotTransientState) void {
+        if (self.reconcile_state) |state| state.deinit();
+    }
+
+    pub fn capture(
+        self: *SnapshotTransientState,
+        restored: *const terminal.Terminal,
+    ) !void {
+        const state = try self.surface.alloc.create(ReconcileState);
+        errdefer self.surface.alloc.destroy(state);
+
+        const title = if (self.surface.config.title == null)
+            try self.surface.alloc.dupeZ(
+                u8,
+                restored.getTitle() orelse restored.getPwd() orelse "",
+            )
+        else
+            null;
+        errdefer if (title) |value| self.surface.alloc.free(value);
+        const restored_pwd = try self.surface.alloc.dupeZ(
+            u8,
+            restored.getPwd() orelse "",
+        );
+        state.* = .{
+            .alloc = self.surface.alloc,
+            .title = title,
+            .pwd = restored_pwd,
+            .mouse_shape = restored.mouse_shape,
+            .secure_input = restored.flags.password_input,
+        };
+        self.reconcile_state = state;
+    }
+
+    pub fn prepare(self: *SnapshotTransientState) void {
+        if (self.surface.search) |*search| search.deinit();
+        self.surface.search = null;
+    }
+
+    pub fn resetLocked(
+        self: *SnapshotTransientState,
+        old_terminal: *terminal.Terminal,
+    ) void {
+        self.surface.mouse.selection_gesture.reset(old_terminal);
+        self.surface.mouse.over_link = false;
+        self.surface.mouse.event_point = null;
+        self.surface.mouse.link_point = null;
+        if (self.surface.inspector) |inspector| inspector.mouse.last_point = null;
+        self.reconcile_state.?.stop_selection_scroll = self.surface.selection_scroll_active;
+        self.surface.selection_scroll_active = false;
+    }
+
+    fn reconcile(self: *SnapshotTransientState) void {
+        const state = self.reconcile_state orelse return;
+        self.reconcile_state = null;
+        defer state.deinit();
+        if (state.stop_selection_scroll) {
+            self.surface.queueIo(.{ .selection_scroll = false }, .unlocked);
+        }
+        if (state.title) |title| {
+            if (self.surface.config.title == null) {
+                _ = self.surface.rt_app.performAction(
+                    .{ .surface = self.surface },
+                    .set_title,
+                    .{ .title = title },
+                ) catch |err| {
+                    log.warn("error reconciling snapshot title err={}", .{err});
+                };
+            }
+        }
+        _ = self.surface.rt_app.performAction(
+            .{ .surface = self.surface },
+            .pwd,
+            .{ .pwd = state.pwd },
+        ) catch |err| {
+            log.warn("error reconciling snapshot directory err={}", .{err});
+        };
+        _ = self.surface.rt_app.performAction(
+            .{ .surface = self.surface },
+            .mouse_shape,
+            state.mouse_shape,
+        ) catch |err| {
+            log.warn("error reconciling snapshot mouse shape err={}", .{err});
+        };
+        _ = self.surface.rt_app.performAction(
+            .{ .surface = self.surface },
+            .secure_input,
+            if (state.secure_input) .on else .off,
+        ) catch |err| {
+            log.warn("error reconciling snapshot secure input err={}", .{err});
+        };
     }
 };
 
@@ -644,38 +757,41 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+        var backend: termio.Backend = if (process_config.host_managed) |host|
+            .{ .host_managed = host }
+        else backend: {
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+            };
+            errdefer env.deinit();
+
+            _ = env.orderedRemove("GHOSTTY_LOG");
+
+            var buf: [18]u8 = undefined;
+            try env.put(
+                "GHOSTTY_SURFACE_ID",
+                std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+            );
+
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .command_wrapper = process_config.command_wrapper,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global.resourcesDir().host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+            break :backend .{ .exec = io_exec };
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        _ = env.orderedRemove("GHOSTTY_LOG");
-
-        var buf: [18]u8 = undefined;
-        try env.put(
-            "GHOSTTY_SURFACE_ID",
-            std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-        );
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .command_wrapper = process_config.command_wrapper,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global.resourcesDir().host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        errdefer backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -685,7 +801,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -882,6 +998,9 @@ fn queueIo(
             .write_small,
             .write_stable,
             .write_alloc,
+            .terminal_reply_small,
+            .terminal_reply_stable,
+            .terminal_reply_alloc,
             => {
                 msg.deinit();
                 return;
@@ -955,6 +1074,11 @@ pub fn deactivateInspector(self: *Surface) void {
 /// True if the surface requires confirmation to quit. This should be called
 /// by apprt to determine if the surface should confirm before quitting.
 pub fn needsConfirmQuit(self: *Surface) bool {
+    switch (self.io.backend) {
+        .exec => {},
+        .host_managed => return false,
+    }
+
     // If the surface is in read-only mode, always require confirmation
     if (self.readonly) return true;
 
@@ -972,6 +1096,78 @@ pub fn needsConfirmQuit(self: *Surface) bool {
             break :true !self.io.terminal.cursorIsAtPrompt();
         },
     };
+}
+
+test "host-managed surface never confirms quit" {
+    const testing = std.testing;
+    const Callback = struct {
+        fn input(_: ?*anyopaque, _: [*]const u8, _: usize) callconv(.c) bool {
+            return true;
+        }
+
+        fn resize(
+            _: ?*anyopaque,
+            _: u16,
+            _: u16,
+            _: u32,
+            _: u32,
+        ) callconv(.c) void {}
+
+        fn inputRejected(_: ?*anyopaque, _: usize) callconv(.c) void {}
+    };
+
+    var surface: Surface = undefined;
+    surface.io.backend = .{ .host_managed = .init(
+        null,
+        Callback.input,
+        Callback.resize,
+        std.math.maxInt(usize),
+        Callback.inputRejected,
+    ) };
+    surface.readonly = true;
+    surface.child_exited = false;
+
+    try testing.expect(!surface.needsConfirmQuit());
+}
+
+test "snapshot restore resets terminal-backed selection state" {
+    const testing = std.testing;
+    var old_terminal = try terminal.Terminal.init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 5, .rows = 2 },
+    );
+    defer old_terminal.deinit(testing.allocator);
+
+    var surface: Surface = undefined;
+    surface.mouse = .{};
+    surface.inspector = null;
+    surface.selection_scroll_active = true;
+    var reconcile_state: SnapshotTransientState.ReconcileState = undefined;
+    var transient: SnapshotTransientState = .{
+        .surface = &surface,
+        .reconcile_state = &reconcile_state,
+    };
+    _ = try surface.mouse.selection_gesture.press(&old_terminal, .{
+        .time = null,
+        .pin = old_terminal.screens.active.pages.pin(.{ .active = .{
+            .x = 1,
+            .y = 0,
+        } }).?,
+        .xpos = 1,
+        .ypos = 0,
+        .max_distance = 1,
+        .repeat_interval = 1,
+        .word_boundary_codepoints = &.{},
+    });
+    try testing.expect(surface.mouse.activeLeftClickPin(&old_terminal.screens) != null);
+
+    transient.resetLocked(&old_terminal);
+
+    try testing.expect(surface.mouse.activeLeftClickPin(&old_terminal.screens) == null);
+    try testing.expect(!surface.selection_scroll_active);
+    try testing.expect(reconcile_state.stop_selection_scroll);
+    transient.reconcile_state = null;
 }
 
 /// Called from the app thread to handle mailbox messages to our specific
@@ -1017,7 +1213,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             // the length of the title and this isn't a performance critical
             // path.
             self.queueIo(.{
-                .write_alloc = .{
+                .terminal_reply_alloc = .{
                     .alloc = self.alloc,
                     .data = data,
                 },
@@ -1263,6 +1459,11 @@ fn selectionScrollTick(self: *Surface) !void {
 }
 
 fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
+    switch (self.io.backend) {
+        .exec => {},
+        .host_managed => return,
+    }
+
     // Mark our flag that we exited immediately
     self.child_exited = true;
 
@@ -1354,6 +1555,7 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+        .host_managed => return,
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
@@ -6117,7 +6319,10 @@ fn startClipboardRequest(
             // Event pastes request only a MIME listing, while ordinary
             // pastes request the text representation as before.
             self.renderer_state.mutex.lockUncancelable(global.io());
-            const event = self.io.terminal.modes.get(.kitty_paste_events);
+            const event = switch (self.io.backend) {
+                .exec => self.io.terminal.modes.get(.kitty_paste_events),
+                .host_managed => false,
+            };
             self.renderer_state.mutex.unlock(global.io());
 
             break :effective if (event)
@@ -6156,9 +6361,10 @@ fn completeClipboardPaste(
     data: []const u8,
     allow_unsafe: bool,
 ) !void {
+    if (self.readonly) return;
     if (data.len == 0) return;
 
-    const encode_opts: input.paste.Options = encode_opts: {
+    const paste_state = paste_state: {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
         const opts: input.paste.Options = .fromTerminal(&self.io.terminal);
@@ -6196,14 +6402,30 @@ fn completeClipboardPaste(
             return error.UnsafePaste;
         }
 
-        // With the lock held, we must scroll to the bottom.
-        // We always scroll to the bottom for these inputs.
+        break :paste_state .{
+            .options = opts,
+            .linefeed = self.io.terminal.modes.get(.linefeed),
+        };
+    };
+    const encode_opts = paste_state.options;
+
+    switch (self.io.backend) {
+        .exec => {},
+        .host_managed => |host| try preflightHostPaste(
+            &host,
+            data,
+            encode_opts,
+            paste_state.linefeed,
+        ),
+    }
+
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         self.scrollToBottom() catch |err| {
             log.warn("error scrolling to bottom err={}", .{err});
         };
-
-        break :encode_opts opts;
-    };
+    }
 
     // Encode the data. In most cases this doesn't require any
     // copies, so we optimize for that case.
@@ -6222,12 +6444,130 @@ fn completeClipboardPaste(
         self.alloc.free(v);
     };
 
-    for (vecs) |vec| if (vec.len > 0) {
-        self.queueIo(try termio.Message.writeReq(
-            self.alloc,
-            vec,
-        ), .unlocked);
+    switch (self.io.backend) {
+        .exec => for (vecs) |vec| if (vec.len > 0) {
+            self.queueIo(try termio.Message.writeReq(
+                self.alloc,
+                vec,
+            ), .unlocked);
+        },
+        .host_managed => {
+            self.queueIo(.{ .write_alloc = .{
+                .alloc = self.alloc,
+                .data = try joinPasteVectors(self.alloc, &vecs),
+            } }, .unlocked);
+        },
+    }
+}
+
+fn preflightHostPaste(
+    host: *const termio.HostManaged,
+    data: []const u8,
+    options: input.paste.Options,
+    linefeed: bool,
+) !void {
+    const frame_len = if (options.bracketed) input.paste.max_frame_size else 0;
+    const len = try std.math.add(usize, data.len, frame_len);
+    var carriage_returns = std.mem.count(u8, data, "\r");
+    if (!options.bracketed) {
+        carriage_returns = try std.math.add(
+            usize,
+            carriage_returns,
+            std.mem.count(u8, data, "\n"),
+        );
+    }
+    _ = try host.preflightInput(len, carriage_returns, linefeed);
+}
+
+fn joinPasteVectors(alloc: Allocator, vecs: []const []const u8) ![]u8 {
+    var len: usize = 0;
+    for (vecs) |vec| len = try std.math.add(usize, len, vec.len);
+
+    const result = try alloc.alloc(u8, len);
+    var offset: usize = 0;
+    for (vecs) |vec| {
+        @memcpy(result[offset..][0..vec.len], vec);
+        offset += vec.len;
+    }
+    return result;
+}
+
+test "host-managed paste is one input transaction" {
+    const testing = std.testing;
+    const Capture = struct {
+        data_calls: usize = 0,
+        rejected_calls: usize = 0,
+        rejected_len: usize = 0,
+
+        fn input(
+            userdata: ?*anyopaque,
+            _: [*]const u8,
+            _: usize,
+        ) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.data_calls += 1;
+            return true;
+        }
+
+        fn resize(
+            _: ?*anyopaque,
+            _: u16,
+            _: u16,
+            _: u32,
+            _: u32,
+        ) callconv(.c) void {}
+
+        fn rejected(userdata: ?*anyopaque, len: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.rejected_calls += 1;
+            self.rejected_len = len;
+        }
     };
+
+    const body = try testing.allocator.alloc(u8, 65 * 1024);
+    defer testing.allocator.free(body);
+    @memset(body, 'a');
+    const vectors = [_][]const u8{ "\x1B[200~", body, "\x1B[201~" };
+
+    var capture: Capture = .{};
+    const rejecting_host: termio.HostManaged = .init(
+        &capture,
+        Capture.input,
+        Capture.resize,
+        64 * 1024,
+        Capture.rejected,
+    );
+    try testing.expectError(
+        error.InputTooLarge,
+        preflightHostPaste(
+            &rejecting_host,
+            body,
+            .{ .bracketed = true },
+            false,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), capture.data_calls);
+    try testing.expectEqual(@as(usize, 1), capture.rejected_calls);
+    try testing.expectEqual(body.len + input.paste.max_frame_size, capture.rejected_len);
+
+    const joined = try joinPasteVectors(testing.allocator, &vectors);
+    defer testing.allocator.free(joined);
+
+    try testing.expectEqual(
+        vectors[0].len + vectors[1].len + vectors[2].len,
+        joined.len,
+    );
+    try testing.expectEqualStrings(vectors[0], joined[0..vectors[0].len]);
+    try testing.expectEqualStrings(
+        vectors[2],
+        joined[joined.len - vectors[2].len ..],
+    );
+}
+
+test "readonly paste returns before accessing terminal state" {
+    var surface: Surface = undefined;
+    surface.readonly = true;
+    try surface.completeClipboardPaste("ignored", true);
 }
 
 /// Send a Kitty clipboard-protocol paste event when mode 5522 is enabled.
@@ -6240,6 +6580,11 @@ fn completeClipboardPasteEvent(
     available: []const []const u8,
 ) !bool {
     if (self.readonly) return false;
+
+    switch (self.io.backend) {
+        .exec => {},
+        .host_managed => return false,
+    }
 
     const kitty_clipboard = terminal.kitty.clipboard;
     const location: terminal.clipboard.Location = switch (clipboard) {
@@ -6326,7 +6671,7 @@ fn completeClipboardReadOSC52(
     const encoded = enc.encode(buf[prefix.len..], data);
     assert(encoded.len == size);
 
-    self.queueIo(.{ .write_alloc = .{
+    self.queueIo(.{ .terminal_reply_alloc = .{
         .alloc = self.alloc,
         .data = buf,
     } }, .unlocked);
@@ -6437,7 +6782,7 @@ fn kittyClipboardStatus(
         .terminator = terminator,
     }).encode(&aw.writer);
 
-    self.queueIo(.{ .write_alloc = .{
+    self.queueIo(.{ .terminal_reply_alloc = .{
         .alloc = self.alloc,
         .data = try aw.toOwnedSlice(),
     } }, .unlocked);
@@ -6493,7 +6838,7 @@ fn completeKittyClipboardRead(
         .terminator = req.terminator,
     }).encode(&aw.writer);
 
-    self.queueIo(.{ .write_alloc = .{
+    self.queueIo(.{ .terminal_reply_alloc = .{
         .alloc = self.alloc,
         .data = try aw.toOwnedSlice(),
     } }, .unlocked);
@@ -6567,6 +6912,47 @@ fn presentSurface(self: *Surface) !void {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
+}
+
+pub fn writeBuffer(self: *Surface, data: []const u8) bool {
+    switch (self.io.backend) {
+        .exec => return false,
+        .host_managed => {},
+    }
+    self.io.processOutput(data);
+    return true;
+}
+
+pub fn prepareSnapshot(
+    self: *Surface,
+    data: []const u8,
+) !*termio.Termio.PreparedSnapshot {
+    switch (self.io.backend) {
+        .exec => return error.UnsupportedBackend,
+        .host_managed => {},
+    }
+    return self.io.prepareSnapshot(data);
+}
+
+pub fn commitSnapshot(
+    self: *Surface,
+    prepared: *termio.Termio.PreparedSnapshot,
+) !void {
+    switch (self.io.backend) {
+        .exec => return error.UnsupportedBackend,
+        .host_managed => {},
+    }
+    var transient: SnapshotTransientState = .{ .surface = self };
+    defer transient.deinit();
+    try transient.capture(&prepared.terminal);
+    self.io.commitSnapshot(prepared, &transient);
+    transient.reconcile();
+}
+
+pub fn restoreSnapshot(self: *Surface, data: []const u8) !void {
+    const prepared = try self.prepareSnapshot(data);
+    defer prepared.deinit();
+    try self.commitSnapshot(prepared);
 }
 
 test "queueIo frees allocated writes in readonly mode" {

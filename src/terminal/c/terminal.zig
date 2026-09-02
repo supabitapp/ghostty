@@ -692,6 +692,11 @@ pub fn zigTerminal(terminal_: Terminal) ?*ZigTerminal {
     return (terminal_ orelse return null).terminal;
 }
 
+pub fn snapshotSafe(terminal_: Terminal) bool {
+    const wrapper = terminal_ orelse return false;
+    return wrapper.stream.handler.snapshotSafe();
+}
+
 /// Attach the persistent C stream and I/O owner to a heap-stable terminal.
 /// The caller retains ownership of both inputs if wrapper allocation fails.
 fn wrap(

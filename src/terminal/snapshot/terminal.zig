@@ -235,13 +235,6 @@
 //! hover state, and incremental compression state are presentation or cache
 //! state and reset during restore.
 //!
-//! Kitty image state and glyph glossary registrations are unsupported by this
-//! snapshot version and are ignored during capture. Unicode virtual placeholder
-//! cells are preserved as grid content, but their image and placement state is
-//! not restored. Build-time terminal behavior, Unicode width policy, parser
-//! continuation, and external callbacks are version-level or caller-local
-//! requirements.
-//!
 //! Native enum declaration indices and mode bit positions used by this format
 //! are snapshot-version registries. Changing any of them requires a snapshot
 //! version bump.

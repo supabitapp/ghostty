@@ -96,6 +96,9 @@ pub const Message = union(enum) {
 
     /// Write where the data is allocated and must be freed.
     write_alloc: WriteReq.Alloc,
+    terminal_reply_small: WriteReq.Small,
+    terminal_reply_stable: WriteReq.Stable,
+    terminal_reply_alloc: WriteReq.Alloc,
 
     /// The payload of the kitty_clipboard_grant_* messages. The
     /// password is allocated and must be freed.
@@ -115,6 +118,15 @@ pub const Message = union(enum) {
         };
     }
 
+    pub fn terminalReply(self: Message) Message {
+        return switch (self) {
+            .write_small => |value| .{ .terminal_reply_small = value },
+            .write_stable => |value| .{ .terminal_reply_stable = value },
+            .write_alloc => |value| .{ .terminal_reply_alloc = value },
+            else => self,
+        };
+    }
+
     /// Free resources owned by a message that will not be processed.
     /// The message is invalid after this call.
     pub fn deinit(self: *const Message) void {
@@ -123,7 +135,7 @@ pub const Message = union(enum) {
                 v.ptr.deinit();
                 v.alloc.destroy(v.ptr);
             },
-            .write_alloc => |v| v.alloc.free(v.data),
+            .write_alloc, .terminal_reply_alloc => |v| v.alloc.free(v.data),
             .kitty_clipboard_grant_read,
             .kitty_clipboard_grant_write,
             => |v| v.alloc.free(v.pw),

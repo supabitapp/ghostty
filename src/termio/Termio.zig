@@ -5,6 +5,7 @@
 pub const Termio = @This();
 
 const std = @import("std");
+const terminal_options = @import("terminal_options");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -286,27 +287,15 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     var backend = opts.backend;
     backend.initTerminal(&term);
 
-    // Create our stream handler. This points to memory in self so it
-    // isn't safe to use until self.* is set.
-    const handler: StreamHandler = .{
-        .alloc = alloc,
-        .termio_mailbox = &self.mailbox,
-        .surface_mailbox = opts.surface_mailbox,
-        .renderer_state = opts.renderer_state,
-        .renderer_wakeup = opts.renderer_wakeup,
-        .renderer_mailbox = opts.renderer_mailbox,
-        .size = &self.size,
-        .terminal = &self.terminal,
-        .osc_color_report_format = opts.config.osc_color_report_format,
-        .clipboard_write = opts.config.clipboard_write,
-        .clipboard_write_limit = opts.config.clipboard_write_limit,
-        .enquiry_response = opts.config.enquiry_response,
+    const host_managed = switch (backend) {
+        .exec => false,
+        .host_managed => true,
     };
 
-    const thread_enter_state = try ThreadEnterState.create(
-        alloc,
-        opts.full_config,
-    );
+    const thread_enter_state = if (host_managed)
+        null
+    else
+        try ThreadEnterState.create(alloc, opts.full_config);
 
     self.* = .{
         .alloc = alloc,
@@ -319,12 +308,54 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .size = opts.size,
         .backend = backend,
         .mailbox = opts.mailbox,
-        .terminal_stream = .init(.{
-            .allocator = alloc,
-            .handler = handler,
-        }),
+        .terminal_stream = undefined,
         .thread_enter_state = thread_enter_state,
     };
+    self.terminal_stream = self.initTerminalStream(null, false);
+}
+
+fn initTerminalStream(
+    self: *Termio,
+    continuation_max_bytes: ?usize,
+    replaying: bool,
+) StreamHandler.Stream {
+    return self.initTerminalStreamFor(
+        &self.terminal,
+        continuation_max_bytes,
+        replaying,
+    );
+}
+
+fn initTerminalStreamFor(
+    self: *Termio,
+    terminal: *terminalpkg.Terminal,
+    continuation_max_bytes: ?usize,
+    replaying: bool,
+) StreamHandler.Stream {
+    return .init(.{
+        .allocator = self.alloc,
+        .continuation_max_bytes = continuation_max_bytes,
+        .handler = .{
+            .alloc = self.alloc,
+            .termio_mailbox = &self.mailbox,
+            .surface_mailbox = self.surface_mailbox,
+            .renderer_state = self.renderer_state,
+            .renderer_wakeup = self.renderer_wakeup,
+            .renderer_mailbox = self.renderer_mailbox,
+            .size = &self.size,
+            .terminal = terminal,
+            .osc_color_report_format = self.config.osc_color_report_format,
+            .clipboard_write = self.config.clipboard_write,
+            .clipboard_write_limit = self.config.clipboard_write_limit,
+            .enquiry_response = self.config.enquiry_response,
+            .replica = switch (self.backend) {
+                .exec => false,
+                .host_managed => true,
+            },
+            .replaying = replaying,
+            .seen_title = terminal.getTitle() != null,
+        },
+    });
 }
 
 pub fn deinit(self: *Termio) void {
@@ -377,7 +408,7 @@ pub fn threadEnter(
 
     // If we have inputs, then queue them all up.
     for (inputs orelse &.{}) |input| switch (input) {
-        .string => |v| self.queueWrite(data, v, false) catch |err| {
+        .string => |v| self.queueWrite(data, v, false, .user_input) catch |err| {
             log.warn("failed to queue input string err={}", .{err});
             return error.InputFailed;
         },
@@ -392,7 +423,7 @@ pub fn threadEnter(
             };
             defer self.alloc.free(contents);
 
-            self.queueWrite(data, contents, false) catch |err| {
+            self.queueWrite(data, contents, false, .user_input) catch |err| {
                 log.warn("failed to queue input file err={}", .{err});
                 return error.InputFailed;
             };
@@ -434,8 +465,9 @@ pub inline fn queueWrite(
     td: *ThreadData,
     data: []const u8,
     linefeed: bool,
+    source: termio.WriteSource,
 ) !void {
-    try self.backend.queueWrite(self.alloc, td, data, linefeed);
+    try self.backend.queueWrite(self.alloc, td, data, linefeed, source);
 }
 
 /// Update the configuration.
@@ -486,16 +518,14 @@ pub fn resize(
     td: *ThreadData,
     size: renderer.Size,
 ) !void {
-    self.size = size;
     const grid_size = size.grid();
-
-    // Update the size of our pty.
-    try self.backend.resize(grid_size, size.terminal());
 
     // Enter the critical area that we want to keep small
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
+
+        self.size = size;
 
         // Update the size of our terminal state
         try self.terminal.resize(
@@ -504,8 +534,8 @@ pub fn resize(
                 .cols = grid_size.columns,
                 .rows = grid_size.rows,
                 .cell_size_px = .{
-                    .width = self.size.cell.width,
-                    .height = self.size.cell.height,
+                    .width = size.cell.width,
+                    .height = size.cell.height,
                 },
             },
         );
@@ -515,6 +545,8 @@ pub fn resize(
             try self.sizeReportLocked(td, .mode_2048);
         }
     }
+
+    try self.backend.resize(grid_size, size.terminal());
 
     // Mail the renderer so that it can update the GPU and re-render
     _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
@@ -547,7 +579,7 @@ fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeRe
         report_size,
     );
 
-    try self.queueWrite(td, writer.buffered(), false);
+    try self.queueWrite(td, writer.buffered(), false, .terminal_reply);
 }
 
 /// Reset the synchronized output mode. This is usually called by timer
@@ -561,6 +593,14 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
+    switch (self.backend) {
+        .exec => {},
+        .host_managed => {
+            try self.queueWrite(td, &[_]u8{0x0C}, false, .user_input);
+            return;
+        },
+    }
+
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
@@ -612,7 +652,7 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
     }
 
     // If we reached here it means we're at a prompt, so we send a form-feed.
-    try self.queueWrite(td, &[_]u8{0x0C}, false);
+    try self.queueWrite(td, &[_]u8{0x0C}, false, .user_input);
 }
 
 /// Scroll the viewport
@@ -650,7 +690,7 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
             log.err("error encoding focus event err={}", .{err});
             return;
         };
-        try self.queueWrite(td, writer.buffered(), false);
+        try self.queueWrite(td, writer.buffered(), false, .terminal_reply);
     }
 
     // We always notify our backend of focus changes.
@@ -666,6 +706,164 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.processOutputLocked(buf);
+}
+
+pub const PreparedSnapshot = struct {
+    alloc: Allocator,
+    terminal: terminalpkg.Terminal,
+    stream: StreamHandler.Stream,
+    linefeed_mode: bool,
+    synchronized_output: bool,
+    owned: bool = true,
+
+    pub fn deinit(self: *PreparedSnapshot) void {
+        if (self.owned) {
+            self.stream.deinit();
+            self.terminal.deinit(self.alloc);
+        }
+        self.alloc.destroy(self);
+    }
+};
+
+pub fn prepareSnapshot(self: *Termio, buf: []const u8) !*PreparedSnapshot {
+    var source: std.Io.Reader = .fixed(buf);
+    var decoded = try terminalpkg.snapshot.decodeExact(
+        self.alloc,
+        global.io(),
+        &source,
+        .{ .max_continuation_bytes = terminalpkg.apc.Protocol.maxDefaultBytes() },
+    );
+    defer decoded.deinit(self.alloc);
+
+    var restored = decoded.toOwned();
+    var restored_owned = true;
+    defer if (restored_owned) restored.deinit(self.alloc);
+
+    const continuation = switch (decoded.continuation) {
+        .ground => "",
+        .bytes => |bytes| bytes,
+    };
+    const replayed = try self.alloc.alloc(u8, continuation.len);
+    defer self.alloc.free(replayed);
+
+    var restored_stream: StreamHandler.Stream = undefined;
+    var restored_stream_owned = false;
+    defer if (restored_stream_owned) restored_stream.deinit();
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    {
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        restored.colors.palette.changeDefault(self.config.palette);
+        restored.colors.background.default = self.config.background.toTerminalRGB();
+        restored.colors.foreground.default = self.config.foreground.toTerminalRGB();
+        restored.colors.cursor.default = if (self.config.cursor_color) |color|
+            color.toTerminalRGB()
+        else
+            null;
+        restored.setDefaultCursorStyle(self.config.cursor_style);
+        restored.setDefaultCursorBlink(self.config.cursor_blink);
+        restored.flags.focused = self.terminal.flags.focused;
+        restored.flags.visible = self.terminal.flags.visible;
+        restored.flags.dirty.clear = true;
+        restored.flags.dirty.palette = true;
+        restored.flags.dirty.glyph_glossary = true;
+        restored.setKittyGraphicsSizeLimit(self.alloc, self.config.image_storage_limit);
+        if (comptime terminal_options.kitty_graphics) {
+            restored.setKittyGraphicsLoadingLimits(
+                self.terminal.screens.active.kitty_images.image_limits,
+            );
+            restored.screens.active.kitty_images.dirty = true;
+        }
+
+        restored_stream = self.initTerminalStreamFor(
+            &restored,
+            continuation.len,
+            true,
+        );
+        restored_stream_owned = true;
+        if (continuation.len > 0) restored_stream.nextSlice(continuation);
+
+        var valid_replay = !restored_stream.handler.semantic_failure and
+            !restored_stream.handler.apc.failed and
+            !restored_stream.handler.dcs.failed and
+            !restored_stream.parser.osc_parser.failed;
+        if (valid_replay and continuation.len > 0) {
+            var writer: std.Io.Writer = .fixed(replayed);
+            restored_stream.writeContinuation(&writer) catch {
+                valid_replay = false;
+            };
+            valid_replay = valid_replay and
+                std.mem.eql(u8, continuation, writer.buffered());
+        } else if (valid_replay) {
+            valid_replay = restored_stream.ground();
+        }
+
+        if (!valid_replay) return error.InvalidContinuation;
+
+        if (restored_stream.continuation) |*tracker| tracker.deinit();
+        restored_stream.continuation = null;
+        restored_stream.handler.replaying = false;
+    }
+
+    const prepared = try self.alloc.create(PreparedSnapshot);
+    prepared.* = .{
+        .alloc = self.alloc,
+        .terminal = restored,
+        .stream = restored_stream,
+        .linefeed_mode = restored.modes.get(.linefeed),
+        .synchronized_output = restored.modes.get(.synchronized_output),
+    };
+    prepared.stream.handler.terminal = &prepared.terminal;
+    restored_owned = false;
+    restored_stream_owned = false;
+    return prepared;
+}
+
+pub fn commitSnapshot(
+    self: *Termio,
+    prepared: *PreparedSnapshot,
+    transient: anytype,
+) void {
+    transient.prepare();
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    {
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        var old_terminal = self.terminal;
+        var old_stream = self.terminal_stream;
+
+        transient.resetLocked(&old_terminal);
+        self.terminal = prepared.terminal;
+        prepared.stream.handler.terminal = &self.terminal;
+        prepared.stream.handler.osc_color_report_format = self.config.osc_color_report_format;
+        prepared.stream.handler.clipboard_write = self.config.clipboard_write;
+        prepared.stream.handler.clipboard_write_limit = self.config.clipboard_write_limit;
+        prepared.stream.handler.enquiry_response = self.config.enquiry_response;
+        self.terminal_stream = prepared.stream;
+        prepared.owned = false;
+        self.renderer_state.terminal = &self.terminal;
+        old_stream.deinit();
+        old_terminal.deinit(self.alloc);
+    }
+
+    self.queueMessage(.{ .linefeed_mode = prepared.linefeed_mode }, .unlocked);
+    if (prepared.synchronized_output) {
+        self.queueMessage(.{ .start_synchronized_output = {} }, .unlocked);
+    }
+    self.renderer_wakeup.notify() catch {};
+}
+
+pub fn restoreSnapshot(
+    self: *Termio,
+    buf: []const u8,
+    transient: anytype,
+) !void {
+    const prepared = try self.prepareSnapshot(buf);
+    defer prepared.deinit();
+    try transient.capture(&prepared.terminal);
+    self.commitSnapshot(prepared, transient);
 }
 
 /// Process output from readdata but the lock is already held.
@@ -752,7 +950,7 @@ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !voi
     var buf: [terminalpkg.device_status.max_color_scheme_report_encode_size]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try terminalpkg.device_status.encodeColorSchemeReport(&writer, scheme);
-    try self.queueWrite(td, writer.buffered(), false);
+    try self.queueWrite(td, writer.buffered(), false, .terminal_reply);
 }
 
 /// Sends a visibility report to the pty. Unforced reports are only sent while
@@ -776,7 +974,7 @@ pub fn visibilityReport(
         &writer,
         if (visible) .potentially_visible else .not_visible,
     );
-    try self.queueWrite(td, writer.buffered(), false);
+    try self.queueWrite(td, writer.buffered(), false, .terminal_reply);
 }
 
 /// ThreadData is the data created and stored in the termio thread
@@ -814,4 +1012,336 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+test "host-managed-snapshot-restore" {
+    const testing = std.testing;
+    const Transient = struct {
+        fn capture(_: *@This(), _: *const terminalpkg.Terminal) !void {}
+        fn prepare(_: *@This()) void {}
+        fn resetLocked(_: *@This(), _: *terminalpkg.Terminal) void {}
+    };
+    const host_background: terminalpkg.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    const program_background: terminalpkg.color.RGB = .{ .r = 4, .g = 5, .b = 6 };
+    const client_background: terminalpkg.color.RGB = .{ .r = 7, .g = 8, .b = 9 };
+    const host_palette: terminalpkg.color.RGB = .{ .r = 10, .g = 11, .b = 12 };
+    const program_palette: terminalpkg.color.RGB = .{ .r = 13, .g = 14, .b = 15 };
+    const client_palette: terminalpkg.color.RGB = .{ .r = 16, .g = 17, .b = 18 };
+
+    var source_colors: terminalpkg.Terminal.Colors = .default;
+    source_colors.background = .init(host_background);
+    source_colors.palette.current[5] = host_palette;
+    source_colors.palette.original[5] = host_palette;
+    var source_terminal = try terminalpkg.Terminal.init(
+        testing.io,
+        testing.allocator,
+        .{
+            .cols = 8,
+            .rows = 2,
+            .colors = source_colors,
+        },
+    );
+    defer source_terminal.deinit(testing.allocator);
+    source_terminal.colors.background.set(program_background);
+    source_terminal.colors.palette.set(5, program_palette);
+    source_terminal.setCursorStyle(.steady_bar);
+
+    var source_stream = terminalpkg.TerminalStream.init(.{
+        .allocator = testing.allocator,
+        .handler = .init(&source_terminal),
+        .continuation_max_bytes = 1024,
+    });
+    defer source_stream.deinit();
+    source_stream.nextSlice(
+        "first\r\nsecond\r\nthird\x1b]2;checkpoint\x07" ++
+            "\x1b]7;file:///tmp/checkpoint\x07\x1b[?1049hA\x1b[31",
+    );
+    source_terminal.modes.set(.linefeed, true);
+    source_terminal.modes.set(.synchronized_output, true);
+
+    var continuation_bytes: [1024]u8 = undefined;
+    var continuation: std.Io.Writer = .fixed(&continuation_bytes);
+    try source_stream.writeContinuation(&continuation);
+
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try terminalpkg.snapshot.encode(
+        testing.allocator,
+        &encoded.writer,
+        &source_terminal,
+        .{ .continuation = .{ .bytes = continuation.buffered() } },
+    );
+
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(testing.allocator, &config);
+    derived.background = .{
+        .r = client_background.r,
+        .g = client_background.g,
+        .b = client_background.b,
+    };
+    derived.palette[5] = client_palette;
+    derived.cursor_style = .underline;
+    derived.cursor_blink = false;
+
+    var io_mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    var ownership_transferred = false;
+    defer if (!ownership_transferred) {
+        io_mailbox.deinit(testing.allocator);
+        derived.deinit();
+    };
+
+    var mutex: std.Io.Mutex = .init;
+    var renderer_state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = undefined,
+    };
+    var renderer_wakeup = try xev.Async.init();
+    defer renderer_wakeup.deinit();
+    const renderer_mailbox = try renderer.Thread.Mailbox.create(testing.allocator);
+    defer renderer_mailbox.destroy(testing.allocator);
+
+    const Callback = struct {
+        fn input(
+            userdata: ?*anyopaque,
+            _: [*]const u8,
+            len: usize,
+        ) callconv(.c) bool {
+            const count: *usize = @ptrCast(@alignCast(userdata.?));
+            count.* += len;
+            return true;
+        }
+
+        fn resize(
+            _: ?*anyopaque,
+            _: u16,
+            _: u16,
+            _: u32,
+            _: u32,
+        ) callconv(.c) void {}
+
+        fn inputRejected(_: ?*anyopaque, _: usize) callconv(.c) void {}
+    };
+
+    const size: renderer.Size = .{
+        .screen = .{ .width = 80, .height = 40 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{},
+    };
+    var initial_terminal = try terminalpkg.Terminal.init(
+        testing.io,
+        testing.allocator,
+        .{
+            .cols = size.grid().columns,
+            .rows = size.grid().rows,
+            .colors = .{
+                .background = .init(derived.background.toTerminalRGB()),
+                .foreground = .init(derived.foreground.toTerminalRGB()),
+                .cursor = .unset,
+                .palette = .init(derived.palette),
+            },
+        },
+    );
+    var terminal_transferred = false;
+    defer if (!terminal_transferred) initial_terminal.deinit(testing.allocator);
+    initial_terminal.flags.focused = false;
+    initial_terminal.flags.visible = false;
+    const initial_image_limits = if (comptime terminal_options.kitty_graphics)
+        initial_terminal.screens.active.kitty_images.image_limits
+    else {};
+
+    var host_input_count: usize = 0;
+    var io: Termio = .{
+        .alloc = testing.allocator,
+        .backend = .{ .host_managed = .init(
+            &host_input_count,
+            Callback.input,
+            Callback.resize,
+            std.math.maxInt(usize),
+            Callback.inputRejected,
+        ) },
+        .config = derived,
+        .terminal = initial_terminal,
+        .renderer_state = &renderer_state,
+        .renderer_wakeup = renderer_wakeup,
+        .renderer_mailbox = renderer_mailbox,
+        .surface_mailbox = undefined,
+        .size = size,
+        .mailbox = io_mailbox,
+        .terminal_stream = undefined,
+    };
+    terminal_transferred = true;
+    renderer_state.terminal = &io.terminal;
+    io.terminal_stream = .init(.{
+        .allocator = testing.allocator,
+        .handler = .{
+            .alloc = testing.allocator,
+            .termio_mailbox = &io.mailbox,
+            .surface_mailbox = io.surface_mailbox,
+            .renderer_state = &renderer_state,
+            .renderer_wakeup = renderer_wakeup,
+            .renderer_mailbox = renderer_mailbox,
+            .size = &io.size,
+            .terminal = &io.terminal,
+            .osc_color_report_format = derived.osc_color_report_format,
+            .clipboard_write = derived.clipboard_write,
+            .clipboard_write_limit = derived.clipboard_write_limit,
+            .enquiry_response = derived.enquiry_response,
+        },
+    });
+    ownership_transferred = true;
+    defer io.deinit();
+
+    io.processOutput("old");
+    var transient: Transient = .{};
+    try io.restoreSnapshot(encoded.written(), &transient);
+
+    try testing.expect(renderer_state.terminal == &io.terminal);
+    try testing.expect(io.terminal.flags.dirty.clear);
+    try testing.expect(io.terminal.flags.dirty.palette);
+    try testing.expect(io.terminal.flags.dirty.glyph_glossary);
+    try testing.expect(!io.terminal.flags.focused);
+    try testing.expect(!io.terminal.flags.visible);
+    try testing.expectEqual(.alternate, io.terminal.screens.active_key);
+    try testing.expectEqualStrings("checkpoint", io.terminal.getTitle().?);
+    try testing.expectEqualStrings("file:///tmp/checkpoint", io.terminal.getPwd().?);
+    try testing.expectEqual(client_background, io.terminal.colors.background.default.?);
+    try testing.expectEqual(program_background, io.terminal.colors.background.override.?);
+    try testing.expectEqual(client_palette, io.terminal.colors.palette.original[5]);
+    try testing.expectEqual(program_palette, io.terminal.colors.palette.current[5]);
+    try testing.expectEqual(
+        terminalpkg.CursorStyle.underline,
+        io.terminal.cursor.default_style,
+    );
+    try testing.expectEqual(
+        terminalpkg.CursorStyle.bar,
+        io.terminal.screens.active.cursor.cursor_style,
+    );
+    try testing.expect(io.terminal.modes.get(.linefeed));
+    try testing.expect(io.terminal.modes.get(.synchronized_output));
+    try testing.expect(io.terminal_stream.handler.replica);
+    if (comptime terminal_options.kitty_graphics) {
+        try testing.expect(io.terminal.screens.active.kitty_images.dirty);
+        try testing.expectEqual(
+            derived.image_storage_limit,
+            io.terminal.screens.active.kitty_images.total_limit,
+        );
+        try testing.expect(std.meta.eql(
+            initial_image_limits,
+            io.terminal.screens.active.kitty_images.image_limits,
+        ));
+    }
+
+    const linefeed_message = io.mailbox.spsc.queue.pop(global.io()).?;
+    defer linefeed_message.deinit();
+    switch (linefeed_message) {
+        .linefeed_mode => |enabled| try testing.expect(enabled),
+        else => try testing.expect(false),
+    }
+    const synchronized_message = io.mailbox.spsc.queue.pop(global.io()).?;
+    defer synchronized_message.deinit();
+    switch (synchronized_message) {
+        .start_synchronized_output => {},
+        else => try testing.expect(false),
+    }
+    io.terminal.modes.set(.focus_event, true);
+    var thread_data: ThreadData = undefined;
+    try io.focusGained(&thread_data, true);
+    try testing.expectEqual(@as(usize, 0), host_input_count);
+
+    source_stream.nextSlice("mB");
+    io.processOutput("mB");
+    const source_text = try source_terminal.plainString(testing.allocator);
+    defer testing.allocator.free(source_text);
+    const restored_text = try io.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(restored_text);
+    try testing.expectEqualStrings(source_text, restored_text);
+    try testing.expectEqual(
+        source_terminal.screens.active.cursor.style_id,
+        io.terminal.screens.active.cursor.style_id,
+    );
+
+    try encoded.writer.writeByte(0);
+    try testing.expectError(
+        error.TrailingData,
+        io.restoreSnapshot(encoded.written(), &transient),
+    );
+    const after_error = try io.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(after_error);
+    try testing.expectEqualStrings(restored_text, after_error);
+
+    var invalid_continuation_snapshot: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer invalid_continuation_snapshot.deinit();
+    try terminalpkg.snapshot.encode(
+        testing.allocator,
+        &invalid_continuation_snapshot.writer,
+        &source_terminal,
+        .{ .continuation = .{ .bytes = "\x1BP$qabc" } },
+    );
+    const terminal_pointer = renderer_state.terminal;
+    try testing.expectError(
+        error.InvalidContinuation,
+        io.restoreSnapshot(invalid_continuation_snapshot.written(), &transient),
+    );
+    try testing.expect(renderer_state.terminal == terminal_pointer);
+    const after_invalid_continuation = try io.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(after_invalid_continuation);
+    try testing.expectEqualStrings(restored_text, after_invalid_continuation);
+
+    const continuation_cases = [_]struct {
+        prefix: []const u8,
+        suffix: []const u8,
+    }{
+        .{ .prefix = "\xE2", .suffix = "\x82\xAC" },
+        .{ .prefix = "\x1B[", .suffix = "31mX" },
+        .{ .prefix = "\x1B]", .suffix = "\x18" },
+        .{ .prefix = "\x1BP", .suffix = "\x18" },
+        .{ .prefix = "\x1B_", .suffix = "\x18" },
+    };
+    for (continuation_cases) |case| {
+        var expected = try terminalpkg.Terminal.init(
+            testing.io,
+            testing.allocator,
+            .{ .cols = 8, .rows = 2 },
+        );
+        defer expected.deinit(testing.allocator);
+        var expected_stream = terminalpkg.TerminalStream.init(.{
+            .allocator = testing.allocator,
+            .handler = .init(&expected),
+            .continuation_max_bytes = 1024,
+        });
+        defer expected_stream.deinit();
+        expected_stream.nextSlice(case.prefix);
+
+        var case_continuation_buffer: [1024]u8 = undefined;
+        var case_continuation: std.Io.Writer = .fixed(&case_continuation_buffer);
+        try expected_stream.writeContinuation(&case_continuation);
+
+        var case_snapshot: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer case_snapshot.deinit();
+        try terminalpkg.snapshot.encode(
+            testing.allocator,
+            &case_snapshot.writer,
+            &expected,
+            .{ .continuation = .{ .bytes = case_continuation.buffered() } },
+        );
+
+        try io.restoreSnapshot(case_snapshot.written(), &transient);
+        try testing.expect(!io.terminal_stream.ground());
+        try testing.expect(io.terminal_stream.handler.replica);
+
+        expected_stream.nextSlice(case.suffix);
+        io.processOutput(case.suffix);
+        try testing.expect(io.terminal_stream.ground());
+
+        const expected_text = try expected.plainString(testing.allocator);
+        defer testing.allocator.free(expected_text);
+        const actual_text = try io.terminal.plainString(testing.allocator);
+        defer testing.allocator.free(actual_text);
+        try testing.expectEqualStrings(expected_text, actual_text);
+        try testing.expectEqual(
+            expected.screens.active.cursor.style_id,
+            io.terminal.screens.active.cursor.style_id,
+        );
+    }
 }

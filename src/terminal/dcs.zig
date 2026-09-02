@@ -12,6 +12,7 @@ const log = std.log.scoped(.terminal_dcs);
 /// terminal.stream dcsHook, dcsPut, and dcsUnhook functions, respectively.
 pub const Handler = struct {
     state: State = .{ .inactive = {} },
+    failed: bool = false,
 
     /// Maximum bytes any DCS command can take. This is to prevent
     /// malicious input from causing us to allocate too much memory.
@@ -24,12 +25,14 @@ pub const Handler = struct {
 
     pub fn hook(self: *Handler, alloc: Allocator, dcs: DCS) ?Command {
         assert(self.state == .inactive);
+        self.failed = false;
 
         // Initialize our state to ignore in case of error
         self.state = .ignore;
 
         // Try to parse the hook.
         const hk_ = self.tryHook(alloc, dcs) catch |err| {
+            self.failed = true;
             log.info("error initializing DCS hook, will ignore hook err={}", .{err});
             return null;
         };
@@ -113,6 +116,7 @@ pub const Handler = struct {
     /// if a command needs to be executed.
     pub fn put(self: *Handler, byte: u8) ?Command {
         return self.tryPut(byte) catch |err| {
+            self.failed = true;
             // On error we just discard our state and ignore the rest
             log.info("error putting byte into DCS handler err={}", .{err});
             self.discard();

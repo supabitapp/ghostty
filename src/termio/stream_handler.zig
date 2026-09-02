@@ -55,6 +55,10 @@ pub const StreamHandler = struct {
     /// (OSC 5522) write transaction; exceeding it aborts with EFBIG.
     clipboard_write_limit: usize,
 
+    replica: bool = false,
+    replaying: bool = false,
+    semantic_failure: bool = false,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -111,6 +115,7 @@ pub const StreamHandler = struct {
     /// isn't guaranteed to happen immediately but it will happen as soon as
     /// practical.
     pub inline fn queueRender(self: *StreamHandler) !void {
+        if (self.replaying) return;
         try self.renderer_wakeup.notify();
     }
 
@@ -131,6 +136,8 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: apprt.surface.Message,
     ) void {
+        if (self.replaying) return;
+
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
@@ -141,7 +148,12 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
-        self.termio_mailbox.send(msg, self.renderer_state.mutex);
+        const tagged = msg.terminalReply();
+        if (self.replaying) {
+            tagged.deinit();
+            return;
+        }
+        self.termio_mailbox.send(tagged, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
 
@@ -153,6 +165,8 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: renderer.Message,
     ) void {
+        if (self.replaying) return;
+
         // See termio.Mailbox.send for more details on how this works.
 
         // Try instant first. If it works then we can return.
@@ -183,6 +197,7 @@ pub const StreamHandler = struct {
         value: Stream.Action.Value(action),
     ) void {
         self.vtFallible(action, value) catch |err| {
+            self.semantic_failure = true;
             log.warn("error handling VT action action={} err={}", .{ action, err });
         };
     }
@@ -990,6 +1005,8 @@ pub const StreamHandler = struct {
     }
 
     fn clipboardContents(self: *StreamHandler, kind: u8, data: []const u8) !void {
+        if (self.replica) return;
+
         // Note: we ignore the "kind" field and always use the standard clipboard.
         // iTerm also appears to do this but other terminals seem to only allow
         // certain. Let's investigate more.
@@ -1024,6 +1041,8 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         v: terminal.osc.Command.KittyClipboardProtocol,
     ) error{ OutOfMemory, WriteFailed }!void {
+        if (self.replica) return;
+
         const kitty_clipboard = terminal.kitty.clipboard;
 
         // Decode and validate the metadata. Malformed structure drops
@@ -1979,6 +1998,22 @@ test "kitty clipboard read: targets-only never consumes a one-time grant" {
     try testing.expect(!handler.kittyClipboardReadGranted("otp", 1));
 }
 
+test "replica suppresses clipboard effects" {
+    var handler: StreamHandler = undefined;
+    handler.replica = true;
+    handler.kitty_clipboard_write = null;
+
+    try handler.clipboardContents('c', "?");
+    try handler.clipboardContents('c', "Y2xpZW50");
+    try handler.kittyClipboard(.{
+        .metadata = "type=write:id=replica",
+        .payload = null,
+        .terminator = .st,
+    });
+
+    try std.testing.expect(handler.kitty_clipboard_write == null);
+}
+
 test "kitty clipboard write: oversized text replies EFBIG" {
     const testing = std.testing;
 
@@ -2026,7 +2061,7 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     const msg = response.?;
     defer msg.deinit();
     switch (msg) {
-        .write_alloc => |v| try testing.expectEqualStrings(
+        .terminal_reply_alloc => |v| try testing.expectEqualStrings(
             "\x1B]5522;type=write:status=EFBIG:id=macos\x1B\\",
             v.data,
         ),

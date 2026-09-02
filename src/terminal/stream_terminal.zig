@@ -247,6 +247,12 @@ pub const Handler = struct {
         self.dcs_handler.deinit();
     }
 
+    pub fn snapshotSafe(self: *const Handler) bool {
+        return !self.semantic_failure and
+            self.kitty_clipboard_write == null and
+            self.kitty_clipboard_grants.isEmpty();
+    }
+
     /// Resize the terminal and apply any side effects (if supported)
     /// as a result of that.
     ///

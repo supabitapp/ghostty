@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -567,6 +568,7 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
     command_wrapper: ?CommandWrapper = null,
+    host_managed: ?termio.HostManaged = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -614,6 +616,13 @@ pub const Surface = struct {
 
         command_wrapper: ?[*]const [*:0]const u8 = null,
         command_wrapper_count: usize = 0,
+
+        host_managed: bool = false,
+        host_userdata: ?*anyopaque = null,
+        host_input: ?termio.HostManaged.InputCallback = null,
+        host_resize: ?termio.HostManaged.ResizeCallback = null,
+        host_input_capacity: usize = 0,
+        host_input_rejected: ?termio.HostManaged.InputRejectedCallback = null,
     };
 
     test "surface options match C layout" {
@@ -626,6 +635,24 @@ pub const Surface = struct {
                 @offsetOf(COptions, field.name),
                 @offsetOf(Options, field.name),
             );
+        }
+
+        inline for (.{ "host_input", "host_resize", "host_input_rejected" }) |name| {
+            const zig_fn = @typeInfo(
+                @typeInfo(@FieldType(Options, name)).optional.child,
+            ).pointer.child;
+            const c_fn = @typeInfo(
+                @typeInfo(@FieldType(COptions, name)).optional.child,
+            ).pointer.child;
+            const zig_info = @typeInfo(zig_fn).@"fn";
+            const c_info = @typeInfo(c_fn).@"fn";
+            try testing.expectEqual(zig_info.calling_convention, c_info.calling_convention);
+            try testing.expectEqual(zig_info.return_type, c_info.return_type);
+            try testing.expectEqual(zig_info.params.len, c_info.params.len);
+            inline for (zig_info.params, c_info.params) |zig_param, c_param| {
+                try testing.expectEqual(@sizeOf(zig_param.type.?), @sizeOf(c_param.type.?));
+                try testing.expectEqual(@alignOf(zig_param.type.?), @alignOf(c_param.type.?));
+            }
         }
     }
 
@@ -664,6 +691,88 @@ pub const Surface = struct {
         }
         config.command = .{ .direct = argv };
         config.@"initial-command" = null;
+    }
+
+    fn applyProcessOptions(config: *Config, opts: Options) !void {
+        if (opts.host_managed) return;
+
+        if (opts.working_directory) |c_wd| {
+            const wd = std.mem.sliceTo(c_wd, 0);
+            if (wd.len > 0) wd: {
+                var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
+                    log.warn(
+                        "error opening requested working directory dir={s} err={}",
+                        .{ wd, err },
+                    );
+                    break :wd;
+                };
+                defer dir.close(global.io());
+
+                const stat = dir.stat(global.io()) catch |err| {
+                    log.warn(
+                        "failed to stat requested working directory dir={s} err={}",
+                        .{ wd, err },
+                    );
+                    break :wd;
+                };
+
+                if (stat.kind != .directory) {
+                    log.warn(
+                        "requested working directory is not a directory dir={s}",
+                        .{wd},
+                    );
+                    break :wd;
+                }
+
+                var wd_val: configpkg.WorkingDirectory = .{ .path = wd };
+                if (wd_val.finalize(config.arenaAlloc())) |_| {
+                    config.@"working-directory" = wd_val;
+                } else |err| {
+                    log.warn(
+                        "error finalizing working directory config dir={s} err={}",
+                        .{ wd_val.path, err },
+                    );
+                }
+            }
+        }
+
+        try applyCommand(
+            config,
+            opts.command,
+            opts.command_argv,
+            opts.command_argv_count,
+        );
+
+        if (opts.env_var_count > 0) {
+            const alloc = config.arenaAlloc();
+            for (opts.env_vars.?[0..opts.env_var_count]) |env_var| {
+                const key = std.mem.sliceTo(env_var.key, 0);
+                const value = std.mem.sliceTo(env_var.value, 0);
+                try config.env.map.put(
+                    alloc,
+                    try alloc.dupeZ(u8, key),
+                    try alloc.dupeZ(u8, value),
+                );
+            }
+        }
+
+        if (opts.initial_input) |c_input| {
+            const alloc = config.arenaAlloc();
+            var buf: std.Io.Writer.Allocating = .init(alloc);
+            defer buf.deinit();
+            try std.zig.stringEscape(
+                std.mem.sliceTo(c_input, 0),
+                &buf.writer,
+            );
+
+            config.input.list.clearRetainingCapacity();
+            try config.input.list.append(
+                alloc,
+                .{ .raw = try buf.toOwnedSliceSentinel(0) },
+            );
+        }
+
+        if (opts.wait_after_command) config.@"wait-after-command" = true;
     }
 
     test "surface command does not imply wait after command" {
@@ -817,6 +926,43 @@ pub const Surface = struct {
         }
     };
 
+    fn initCommandWrapper(alloc: Allocator, opts: Options) !?CommandWrapper {
+        if (opts.host_managed) return null;
+        return try CommandWrapper.init(
+            alloc,
+            opts.command_wrapper,
+            opts.command_wrapper_count,
+        );
+    }
+
+    test "host-managed surface ignores process options" {
+        const testing = std.testing;
+        var config = try Config.default(testing.allocator);
+        defer config.deinit();
+
+        const wrapper_source = [_][*:0]const u8{"wrapper"};
+        const opts: Options = .{
+            .working_directory = "/path/that/must/not/be-opened",
+            .command = "ignored",
+            .command_argv_count = 1,
+            .env_var_count = 1,
+            .initial_input = "ignored",
+            .wait_after_command = true,
+            .command_wrapper = &wrapper_source,
+            .command_wrapper_count = wrapper_source.len,
+            .host_managed = true,
+        };
+
+        try testing.expect(try initCommandWrapper(testing.allocator, opts) == null);
+        try applyProcessOptions(&config, opts);
+
+        try testing.expect(config.command == null);
+        try testing.expect(config.@"working-directory" == null);
+        try testing.expectEqual(@as(usize, 0), config.env.map.count());
+        try testing.expectEqual(@as(usize, 0), config.input.list.items.len);
+        try testing.expect(!config.@"wait-after-command");
+    }
+
     test "Surface command wrapper owns and inherits Zmx argv shapes" {
         const testing = std.testing;
         var create_executable = "/tmp/zmx".*;
@@ -894,12 +1040,23 @@ pub const Surface = struct {
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
         const surface_alloc = app.core_app.alloc;
-        const command_wrapper = try CommandWrapper.init(
-            surface_alloc,
-            opts.command_wrapper,
-            opts.command_wrapper_count,
-        );
+        const command_wrapper = try initCommandWrapper(surface_alloc, opts);
         errdefer if (command_wrapper) |wrapper| wrapper.deinit(surface_alloc);
+
+        const host_managed: ?termio.HostManaged = if (opts.host_managed)
+            .init(
+                opts.host_userdata,
+                opts.host_input orelse return error.HostInputCallbackRequired,
+                opts.host_resize orelse return error.HostResizeCallbackRequired,
+                if (opts.host_input_capacity > 0)
+                    opts.host_input_capacity
+                else
+                    return error.HostInputCapacityRequired,
+                opts.host_input_rejected orelse
+                    return error.HostInputRejectedCallbackRequired,
+            )
+        else
+            null;
 
         self.* = .{
             .app = app,
@@ -913,6 +1070,7 @@ pub const Surface = struct {
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
             .command_wrapper = command_wrapper,
+            .host_managed = host_managed,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -923,99 +1081,17 @@ pub const Surface = struct {
         var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
         defer config.deinit();
 
-        // If we have a working directory from the options then we set it.
-        if (opts.working_directory) |c_wd| {
-            const wd = std.mem.sliceTo(c_wd, 0);
-            if (wd.len > 0) wd: {
-                var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
-                    log.warn(
-                        "error opening requested working directory dir={s} err={}",
-                        .{ wd, err },
-                    );
-                    break :wd;
-                };
-                defer dir.close(global.io());
-
-                const stat = dir.stat(global.io()) catch |err| {
-                    log.warn(
-                        "failed to stat requested working directory dir={s} err={}",
-                        .{ wd, err },
-                    );
-                    break :wd;
-                };
-
-                if (stat.kind != .directory) {
-                    log.warn(
-                        "requested working directory is not a directory dir={s}",
-                        .{wd},
-                    );
-                    break :wd;
-                }
-
-                var wd_val: configpkg.WorkingDirectory = .{ .path = wd };
-                if (wd_val.finalize(config.arenaAlloc())) |_| {
-                    config.@"working-directory" = wd_val;
-                } else |err| {
-                    log.warn(
-                        "error finalizing working directory config dir={s} err={}",
-                        .{ wd_val.path, err },
-                    );
-                }
-            }
-        }
-
-        try applyCommand(
-            &config,
-            opts.command,
-            opts.command_argv,
-            opts.command_argv_count,
-        );
-
-        // Apply any environment variables that were requested.
-        if (opts.env_var_count > 0) {
-            const alloc = config.arenaAlloc();
-            for (opts.env_vars.?[0..opts.env_var_count]) |env_var| {
-                const key = std.mem.sliceTo(env_var.key, 0);
-                const value = std.mem.sliceTo(env_var.value, 0);
-                try config.env.map.put(
-                    alloc,
-                    try alloc.dupeZ(u8, key),
-                    try alloc.dupeZ(u8, value),
-                );
-            }
-        }
-
-        // If we have an initial input then we set it.
-        if (opts.initial_input) |c_input| {
-            const alloc = config.arenaAlloc();
-
-            // We need to escape the string because the "raw" field
-            // expects a Zig string.
-            var buf: std.Io.Writer.Allocating = .init(alloc);
-            defer buf.deinit();
-            try std.zig.stringEscape(
-                std.mem.sliceTo(c_input, 0),
-                &buf.writer,
-            );
-
-            config.input.list.clearRetainingCapacity();
-            try config.input.list.append(
-                alloc,
-                .{ .raw = try buf.toOwnedSliceSentinel(0) },
-            );
-        }
-
-        // Wait after command
-        if (opts.wait_after_command) {
-            config.@"wait-after-command" = true;
-        }
+        try applyProcessOptions(&config, opts);
 
         // Initialize our surface right away. We're given a view that is
         // ready to use.
         try self.core_surface.init(
             surface_alloc,
             &config,
-            .{ .command_wrapper = if (command_wrapper) |wrapper| wrapper.args else &.{} },
+            .{
+                .command_wrapper = if (command_wrapper) |wrapper| wrapper.args else &.{},
+                .host_managed = host_managed,
+            },
             app.core_app,
             app,
             self,
@@ -1672,6 +1748,14 @@ pub const Surface = struct {
             .context = context,
         };
         if (self.command_wrapper) |wrapper| wrapper.inherit(&opts);
+        if (self.host_managed) |host| {
+            opts.host_managed = true;
+            opts.host_userdata = host.userdata;
+            opts.host_input = host.input;
+            opts.host_resize = host.resize_callback;
+            opts.host_input_capacity = host.input_capacity;
+            opts.host_input_rejected = host.input_rejected;
+        }
         return opts;
     }
 
@@ -1967,6 +2051,12 @@ pub const Inspector = struct {
 
 // C API
 pub const CAPI = struct {
+    const PreparedSurfaceSnapshot = struct {
+        alloc: Allocator,
+        surface: *Surface,
+        prepared: *termio.Termio.PreparedSnapshot,
+    };
+
     /// This is the same as Surface.KeyEvent but this is the raw C API version.
     const KeyEvent = extern struct {
         action: input.Action,
@@ -2361,6 +2451,74 @@ pub const CAPI = struct {
     /// Returns true if the surface process has exited.
     export fn ghostty_surface_process_exited(surface: *Surface) bool {
         return surface.core_surface.child_exited;
+    }
+
+    export fn ghostty_surface_write_buffer(
+        surface: *Surface,
+        data: ?[*]const u8,
+        len: usize,
+    ) bool {
+        const bytes = if (data) |ptr| ptr[0..len] else if (len == 0) "" else return false;
+        return surface.core_surface.writeBuffer(bytes);
+    }
+
+    export fn ghostty_surface_prepare_snapshot(
+        surface: *Surface,
+        data: ?[*]const u8,
+        len: usize,
+    ) ?*PreparedSurfaceSnapshot {
+        const bytes = if (data) |ptr| ptr[0..len] else if (len == 0) "" else return null;
+        const prepared = surface.core_surface.prepareSnapshot(bytes) catch |err| {
+            log.warn("error preparing surface snapshot err={}", .{err});
+            return null;
+        };
+        const alloc = surface.app.core_app.alloc;
+        const result = alloc.create(PreparedSurfaceSnapshot) catch {
+            prepared.deinit();
+            return null;
+        };
+        result.* = .{
+            .alloc = alloc,
+            .surface = surface,
+            .prepared = prepared,
+        };
+        return result;
+    }
+
+    export fn ghostty_surface_commit_snapshot(
+        surface: *Surface,
+        snapshot: ?*PreparedSurfaceSnapshot,
+    ) bool {
+        const value = snapshot orelse return false;
+        if (value.surface != surface) return false;
+        surface.core_surface.commitSnapshot(value.prepared) catch |err| {
+            log.warn("error committing surface snapshot err={}", .{err});
+            return false;
+        };
+        value.prepared.deinit();
+        value.alloc.destroy(value);
+        return true;
+    }
+
+    export fn ghostty_surface_snapshot_free(
+        snapshot: ?*PreparedSurfaceSnapshot,
+    ) void {
+        const value = snapshot orelse return;
+        value.prepared.deinit();
+        value.alloc.destroy(value);
+    }
+
+    export fn ghostty_surface_restore_snapshot(
+        surface: *Surface,
+        data: ?[*]const u8,
+        len: usize,
+    ) bool {
+        const bytes = if (data) |ptr| ptr[0..len] else if (len == 0) "" else return false;
+        surface.core_surface.restoreSnapshot(bytes) catch |err| {
+            log.warn("error restoring surface snapshot err={}", .{err});
+            return false;
+        };
+        return true;
     }
 
     /// Returns true if the surface has a selection.

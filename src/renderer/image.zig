@@ -1152,6 +1152,53 @@ pub const Image = union(enum) {
     }
 };
 
+test "restored terminal clears stale kitty renderer state" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .rows = 1, .cols = 1 });
+    defer t.deinit(alloc);
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+
+    const pixels = try alloc.dupe(u8, "rgba");
+    try state.images.put(alloc, .{ .kitty = 1 }, .{
+        .image = .{ .pending = .{
+            .width = 1,
+            .height = 1,
+            .pixel_format = .rgba,
+            .data = pixels.ptr,
+        } },
+        .generation = 1,
+    });
+    try state.kitty_placements.append(alloc, .{
+        .image_id = .{ .kitty = 1 },
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .width = 1,
+        .height = 1,
+        .cell_offset_x = 0,
+        .cell_offset_y = 0,
+        .source_x = 0,
+        .source_y = 0,
+        .source_width = 1,
+        .source_height = 1,
+    });
+
+    t.screens.active.kitty_images.dirty = true;
+    try testing.expect(state.kittyRequiresUpdate(&t));
+
+    state.kittyUpdate(alloc, &t, .{ .width = 1, .height = 1 });
+    try testing.expect(!t.screens.active.kitty_images.dirty);
+    try testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
+    try testing.expect(state.images.get(.{ .kitty = 1 }).?.image.isUnloading());
+
+    try testing.expect(state.upload(alloc, undefined));
+    try testing.expectEqual(@as(usize, 0), state.images.count());
+}
+
 test "kitty renderer ignores pending payloads and removes replaced placements" {
     const testing = std.testing;
     const alloc = testing.allocator;

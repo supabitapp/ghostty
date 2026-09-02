@@ -28,6 +28,10 @@ pub const Grants = struct {
         one_time: bool = false,
     };
 
+    pub fn isEmpty(self: *const Grants) bool {
+        return self.entries.items.len == 0;
+    }
+
     pub fn deinit(self: *Grants, alloc: Allocator) void {
         for (self.entries.items) |entry| alloc.free(entry.pw);
         self.entries.deinit(alloc);

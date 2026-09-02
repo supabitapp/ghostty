@@ -117,6 +117,10 @@ pub fn contains(self: *Glossary, cp: u21) bool {
     return self.entries.contains(cp);
 }
 
+pub fn isEmpty(self: *const Glossary) bool {
+    return self.entries.count() == 0;
+}
+
 /// A single glyph registration entry.
 pub const Entry = struct {
     /// Stored glyph payload variants.

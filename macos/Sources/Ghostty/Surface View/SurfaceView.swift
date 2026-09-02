@@ -599,6 +599,13 @@ extension Ghostty {
         /// Context for surface creation
         var context: ghostty_surface_context_e = GHOSTTY_SURFACE_CONTEXT_WINDOW
 
+        var hostManaged: Bool = false
+        var hostUserdata: UnsafeMutableRawPointer?
+        var hostInput: ghostty_surface_host_input_cb?
+        var hostResize: ghostty_surface_host_resize_cb?
+        var hostInputCapacity: Int = 0
+        var hostInputRejected: ghostty_surface_host_input_rejected_cb?
+
         init() {}
 
         init(from config: ghostty_surface_config_s) {
@@ -621,6 +628,12 @@ extension Ghostty {
                 }
             }
             self.context = config.context
+            self.hostManaged = config.host_managed
+            self.hostUserdata = config.host_userdata
+            self.hostInput = config.host_input
+            self.hostResize = config.host_resize
+            self.hostInputCapacity = config.host_input_capacity
+            self.hostInputRejected = config.host_input_rejected
         }
 
         /// Provides a C-compatible ghostty configuration within a closure. The configuration
@@ -642,6 +655,13 @@ extension Ghostty {
 
             // Set context
             config.context = context
+
+            config.host_managed = hostManaged
+            config.host_userdata = hostUserdata
+            config.host_input = hostInput
+            config.host_resize = hostResize
+            config.host_input_capacity = hostInputCapacity
+            config.host_input_rejected = hostInputRejected
 
             // Use withCString to ensure strings remain valid for the duration of the closure
             return try workingDirectory.withCString { cWorkingDir in
