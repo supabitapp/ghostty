@@ -176,7 +176,25 @@ pub const Message = union(enum) {
             .none => void,
         };
     };
+
+    pub fn deinit(self: Message) void {
+        switch (self) {
+            .kitty_clipboard_read => |req| req.destroy(),
+            .kitty_clipboard_write => |req| req.destroy(),
+            .clipboard_write => |write| write.req.deinit(),
+            .pwd_change => |req| req.deinit(),
+            else => {},
+        }
+    }
 };
+
+test "surface message deinit releases owned data" {
+    const req = try Message.WriteReq.init(
+        std.testing.allocator,
+        @as([]const u8, "owned surface message" ** 32),
+    );
+    (Message{ .pwd_change = req }).deinit();
+}
 
 /// A surface mailbox.
 pub const Mailbox = struct {

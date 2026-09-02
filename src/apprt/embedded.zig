@@ -614,6 +614,21 @@ pub const Surface = struct {
 
         command_wrapper: ?[*]const [*:0]const u8 = null,
         command_wrapper_count: usize = 0,
+
+        host_managed: bool = false,
+        host_managed_userdata: ?*anyopaque = null,
+        host_managed_input: ?*const fn (
+            ?*anyopaque,
+            [*]const u8,
+            usize,
+        ) callconv(.c) void = null,
+        host_managed_resize: ?*const fn (
+            ?*anyopaque,
+            u16,
+            u16,
+            u32,
+            u32,
+        ) callconv(.c) void = null,
     };
 
     test "surface options match C layout" {
@@ -901,6 +916,15 @@ pub const Surface = struct {
         );
         errdefer if (command_wrapper) |wrapper| wrapper.deinit(surface_alloc);
 
+        const host_managed: ?@import("../termio.zig").HostManaged.Config = if (opts.host_managed)
+            .{
+                .userdata = opts.host_managed_userdata,
+                .input = opts.host_managed_input orelse return error.HostManagedInputMissing,
+                .resize = opts.host_managed_resize orelse return error.HostManagedResizeMissing,
+            }
+        else
+            null;
+
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
@@ -1015,7 +1039,10 @@ pub const Surface = struct {
         try self.core_surface.init(
             surface_alloc,
             &config,
-            .{ .command_wrapper = if (command_wrapper) |wrapper| wrapper.args else &.{} },
+            .{
+                .command_wrapper = if (command_wrapper) |wrapper| wrapper.args else &.{},
+                .host_managed = host_managed,
+            },
             app.core_app,
             app,
             self,
@@ -2315,6 +2342,32 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_free(ptr: *Surface) void {
         ptr.app.closeSurface(ptr);
+    }
+
+    export fn ghostty_surface_write_buffer(
+        surface: *Surface,
+        data: ?[*]const u8,
+        len: usize,
+    ) bool {
+        const bytes = surfaceBytes(data, len) orelse return false;
+        surface.core_surface.writeBuffer(bytes) catch return false;
+        return true;
+    }
+
+    export fn ghostty_surface_restore_snapshot(
+        surface: *Surface,
+        data: ?[*]const u8,
+        len: usize,
+    ) bool {
+        const bytes = surfaceBytes(data, len) orelse return false;
+        surface.core_surface.restoreSnapshot(bytes) catch return false;
+        return true;
+    }
+
+    fn surfaceBytes(data: ?[*]const u8, len: usize) ?[]const u8 {
+        if (data) |ptr| return ptr[0..len];
+        if (len == 0) return &.{};
+        return null;
     }
 
     /// Returns the userdata associated with the surface.

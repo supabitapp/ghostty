@@ -55,6 +55,10 @@ pub const StreamHandler = struct {
     /// (OSC 5522) write transaction; exceeding it aborts with EFBIG.
     clipboard_write_limit: usize,
 
+    terminal_responses: bool = true,
+
+    surface_effects: bool = true,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -131,6 +135,10 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: apprt.surface.Message,
     ) void {
+        if (!self.surface_effects) {
+            msg.deinit();
+            return;
+        }
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
@@ -141,6 +149,10 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (!self.terminal_responses) {
+            msg.deinit();
+            return;
+        }
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
@@ -1963,6 +1975,109 @@ test "OSC 133 B and I signal shell ready" {
     }
 }
 
+test "host-managed replicas suppress parser terminal replies" {
+    const testing = std.testing;
+    const AuthorityStream = @import("../terminal/stream_terminal.zig");
+
+    const Authority = struct {
+        var replies: usize = 0;
+
+        fn writePty(_: *AuthorityStream.Handler, _: []const u8) void {
+            replies += 1;
+        }
+
+        fn deviceAttributes(_: *AuthorityStream.Handler) terminal.device_attributes.Attributes {
+            return .{};
+        }
+
+        fn size(_: *AuthorityStream.Handler) ?terminal.size_report.Size {
+            return .{ .rows = 24, .columns = 80, .cell_width = 8, .cell_height = 16 };
+        }
+    };
+
+    var authority_terminal = try terminal.Terminal.init(
+        testing.io,
+        testing.allocator,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .colors = .{
+                .background = .init(.{ .r = 0, .g = 0, .b = 0 }),
+                .foreground = .init(.{ .r = 255, .g = 255, .b = 255 }),
+                .cursor = .unset,
+                .palette = .default,
+            },
+        },
+    );
+    defer authority_terminal.deinit(testing.allocator);
+    var authority_handler: AuthorityStream.Handler = .init(&authority_terminal);
+    authority_handler.effects.write_pty = &Authority.writePty;
+    authority_handler.effects.device_attributes = &Authority.deviceAttributes;
+    authority_handler.effects.size = &Authority.size;
+    var authority_stream: AuthorityStream.Stream = .init(.{
+        .allocator = testing.allocator,
+        .handler = authority_handler,
+    });
+    defer authority_stream.deinit();
+    const queries = "\x1b[5n\x1b[c\x1b[?7$p\x1b]10;?\x1b\\\x1b[18t";
+    Authority.replies = 0;
+    authority_stream.nextSlice(queries);
+    try testing.expectEqual(@as(usize, 5), Authority.replies);
+
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+    var terminal_state = try terminal.Terminal.init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer terminal_state.deinit(testing.allocator);
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+    var renderer_state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = &terminal_state,
+    };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.termio_mailbox = &mailbox;
+    handler.renderer_state = &renderer_state;
+    handler.terminal = &terminal_state;
+    handler.clipboard_write = .allow;
+    handler.terminal_responses = false;
+    handler.surface_effects = false;
+    handler.termio_messaged = false;
+
+    for (0..2) |_| {
+        try handler.deviceAttributes(.primary);
+        try handler.deviceStatusReport(.operating_status);
+        try handler.requestMode(.wraparound);
+        try handler.deviceStatusReport(.color_scheme);
+        handler.messageWriter(.{ .size_report = .csi_18_t });
+        handler.messageWriter(try termio.Message.writeReq(
+            testing.allocator,
+            @as([]const u8, "a terminal reply long enough to require allocated storage"),
+        ));
+    }
+    try testing.expect(!handler.termio_messaged);
+    try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+    try testing.expectEqual(@as(usize, 5), Authority.replies);
+
+    authority_stream.nextSlice(queries);
+    try testing.expectEqual(@as(usize, 10), Authority.replies);
+
+    handler.terminal_responses = true;
+    try handler.deviceStatusReport(.operating_status);
+    try testing.expect(handler.termio_messaged);
+    const response = mailbox.spsc.queue.pop(global.io()).?;
+    defer response.deinit();
+    switch (response) {
+        .write_stable => |bytes| try testing.expectEqualStrings("\x1b[0n", bytes),
+        else => try testing.expect(false),
+    }
+}
+
 test "kitty clipboard read: targets-only never consumes a one-time grant" {
     const testing = std.testing;
 
@@ -1999,6 +2114,7 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     handler.renderer_state = &renderer_state;
     handler.clipboard_write = .allow;
     handler.clipboard_write_limit = 4;
+    handler.terminal_responses = true;
     handler.kitty_clipboard_write = null;
     defer handler.kittyClipboardWriteAbort();
 

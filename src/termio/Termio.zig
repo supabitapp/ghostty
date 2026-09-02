@@ -286,23 +286,6 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     var backend = opts.backend;
     backend.initTerminal(&term);
 
-    // Create our stream handler. This points to memory in self so it
-    // isn't safe to use until self.* is set.
-    const handler: StreamHandler = .{
-        .alloc = alloc,
-        .termio_mailbox = &self.mailbox,
-        .surface_mailbox = opts.surface_mailbox,
-        .renderer_state = opts.renderer_state,
-        .renderer_wakeup = opts.renderer_wakeup,
-        .renderer_mailbox = opts.renderer_mailbox,
-        .size = &self.size,
-        .terminal = &self.terminal,
-        .osc_color_report_format = opts.config.osc_color_report_format,
-        .clipboard_write = opts.config.clipboard_write,
-        .clipboard_write_limit = opts.config.clipboard_write_limit,
-        .enquiry_response = opts.config.enquiry_response,
-    };
-
     const thread_enter_state = try ThreadEnterState.create(
         alloc,
         opts.full_config,
@@ -319,11 +302,35 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .size = opts.size,
         .backend = backend,
         .mailbox = opts.mailbox,
-        .terminal_stream = .init(.{
-            .allocator = alloc,
-            .handler = handler,
-        }),
+        .terminal_stream = undefined,
         .thread_enter_state = thread_enter_state,
+    };
+    self.terminal_stream = .init(.{
+        .allocator = alloc,
+        .handler = self.streamHandler(&self.terminal, !self.backend.isHostManaged()),
+    });
+}
+
+fn streamHandler(
+    self: *Termio,
+    terminal: *terminalpkg.Terminal,
+    terminal_responses: bool,
+) StreamHandler {
+    return .{
+        .alloc = self.alloc,
+        .termio_mailbox = &self.mailbox,
+        .surface_mailbox = self.surface_mailbox,
+        .renderer_state = self.renderer_state,
+        .renderer_wakeup = self.renderer_wakeup,
+        .renderer_mailbox = self.renderer_mailbox,
+        .size = &self.size,
+        .terminal = terminal,
+        .osc_color_report_format = self.config.osc_color_report_format,
+        .clipboard_write = self.config.clipboard_write,
+        .clipboard_write_limit = self.config.clipboard_write_limit,
+        .enquiry_response = self.config.enquiry_response,
+        .terminal_responses = terminal_responses,
+        .surface_effects = terminal_responses,
     };
 }
 
@@ -638,6 +645,7 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
 
 /// Called when focus is gained or lost (when focus events are enabled)
 pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
+    if (self.backend.isHostManaged()) return;
     self.renderer_state.mutex.lockUncancelable(global.io());
     const focus_event = self.renderer_state.terminal.modes.get(.focus_event);
     self.renderer_state.mutex.unlock(global.io());
@@ -666,6 +674,82 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.processOutputLocked(buf);
+}
+
+pub const RestoreSnapshotError = terminalpkg.snapshot.DecodeExactError || error{
+    SnapshotContinuationMismatch,
+    UnsupportedBackend,
+};
+
+pub fn restoreSnapshot(
+    self: *Termio,
+    bytes: []const u8,
+) RestoreSnapshotError!void {
+    if (!self.backend.isHostManaged()) return error.UnsupportedBackend;
+
+    var restored = try decodeSnapshot(self.alloc, bytes, .{
+        .palette = self.config.palette,
+        .background = self.config.background.toTerminalRGB(),
+        .foreground = self.config.foreground.toTerminalRGB(),
+        .cursor = if (self.config.cursor_color) |color| color.toTerminalRGB() else null,
+        .cursor_style = self.config.cursor_style,
+        .cursor_blink = self.config.cursor_blink,
+    });
+    defer restored.deinit(self.alloc);
+    var stream = try initRestoredStream(
+        StreamHandler.Stream,
+        self.alloc,
+        self.streamHandler(&restored.terminal.?, false),
+        restored.continuation,
+    );
+    errdefer stream.deinit();
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    self.terminal_stream.deinit();
+    self.terminal.deinit(self.alloc);
+    self.terminal = restored.takeTerminal();
+    self.renderer_state.terminal = &self.terminal;
+    stream.handler.terminal = &self.terminal;
+    self.terminal_stream = stream;
+    self.last_cursor_reset = null;
+    self.terminal_stream.handler.queueRender() catch unreachable;
+}
+
+fn initRestoredStream(
+    comptime Stream: type,
+    alloc: Allocator,
+    handler: anytype,
+    continuation: terminalpkg.snapshot.Continuation,
+) (Allocator.Error || error{SnapshotContinuationMismatch})!Stream {
+    var stream: Stream = .init(.{
+        .allocator = alloc,
+        .handler = handler,
+        .continuation_max_bytes = switch (continuation) {
+            .ground => null,
+            .bytes => |bytes| bytes.len,
+        },
+    });
+    errdefer stream.deinit();
+
+    switch (continuation) {
+        .ground => {
+            if (!stream.ground()) return error.SnapshotContinuationMismatch;
+        },
+        .bytes => |bytes| {
+            stream.nextSlice(bytes);
+            const replayed = try alloc.alloc(u8, bytes.len);
+            defer alloc.free(replayed);
+            var writer: std.Io.Writer = .fixed(replayed);
+            stream.writeContinuation(&writer) catch return error.SnapshotContinuationMismatch;
+            if (!std.mem.eql(u8, bytes, writer.buffered())) {
+                return error.SnapshotContinuationMismatch;
+            }
+        },
+    }
+
+    return stream;
 }
 
 /// Process output from readdata but the lock is already held.
@@ -734,6 +818,7 @@ pub fn kittyClipboardGrant(
 }
 
 pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
+    if (self.backend.isHostManaged()) return;
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
@@ -763,6 +848,7 @@ pub fn visibilityReport(
     visible: bool,
     force: bool,
 ) !void {
+    if (self.backend.isHostManaged()) return;
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
@@ -808,6 +894,302 @@ pub const ThreadData = struct {
         self.* = undefined;
     }
 };
+
+const SnapshotDefaults = struct {
+    palette: terminalpkg.color.Palette,
+    background: terminalpkg.color.RGB,
+    foreground: terminalpkg.color.RGB,
+    cursor: ?terminalpkg.color.RGB,
+    cursor_style: terminalpkg.Screen.CursorStyle,
+    cursor_blink: ?bool,
+};
+
+const RestoredSnapshot = struct {
+    terminal: ?terminalpkg.Terminal,
+    continuation: terminalpkg.snapshot.Continuation,
+
+    fn takeTerminal(self: *RestoredSnapshot) terminalpkg.Terminal {
+        const result = self.terminal.?;
+        self.terminal = null;
+        return result;
+    }
+
+    fn deinit(self: *RestoredSnapshot, alloc: Allocator) void {
+        if (self.terminal) |*terminal| terminal.deinit(alloc);
+        switch (self.continuation) {
+            .ground => {},
+            .bytes => |bytes| alloc.free(bytes),
+        }
+        self.* = undefined;
+    }
+};
+
+fn decodeSnapshot(
+    alloc: Allocator,
+    bytes: []const u8,
+    defaults: SnapshotDefaults,
+) terminalpkg.snapshot.DecodeExactError!RestoredSnapshot {
+    var reader: std.Io.Reader = .fixed(bytes);
+    var decoded = try terminalpkg.snapshot.decodeExact(
+        alloc,
+        global.io(),
+        &reader,
+        .{ .max_continuation_bytes = 16 * 1024 * 1024 },
+    );
+    errdefer decoded.deinit(alloc);
+
+    var terminal = decoded.toOwned();
+    terminal.colors.palette.changeDefault(defaults.palette);
+    terminal.colors.background.default = defaults.background;
+    terminal.colors.foreground.default = defaults.foreground;
+    terminal.colors.cursor.default = defaults.cursor;
+    terminal.setDefaultCursorStyle(defaults.cursor_style);
+    terminal.setDefaultCursorBlink(defaults.cursor_blink);
+
+    return .{
+        .terminal = terminal,
+        .continuation = decoded.continuation,
+    };
+}
+
+test "host-managed snapshot restore keeps program colors and applies renderer defaults" {
+    const testing = std.testing;
+    const RGB = terminalpkg.color.RGB;
+
+    var source_palette = terminalpkg.color.default;
+    source_palette[1] = .{ .r = 10, .g = 20, .b = 30 };
+    var source = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .colors = .{
+            .background = .init(.{ .r = 1, .g = 2, .b = 3 }),
+            .foreground = .init(.{ .r = 4, .g = 5, .b = 6 }),
+            .cursor = .init(.{ .r = 7, .g = 8, .b = 9 }),
+            .palette = .init(source_palette),
+        },
+    });
+    defer source.deinit(testing.allocator);
+    source.colors.palette.set(1, .{ .r = 101, .g = 102, .b = 103 });
+    source.colors.background.set(.{ .r = 111, .g = 112, .b = 113 });
+
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try terminalpkg.snapshot.encode(
+        testing.allocator,
+        &encoded.writer,
+        &source,
+        .{ .continuation = .ground },
+    );
+
+    var renderer_palette = terminalpkg.color.default;
+    renderer_palette[1] = .{ .r = 20, .g = 30, .b = 40 };
+    var restored = try decodeSnapshot(testing.allocator, encoded.written(), .{
+        .palette = renderer_palette,
+        .background = .{ .r = 21, .g = 22, .b = 23 },
+        .foreground = .{ .r = 24, .g = 25, .b = 26 },
+        .cursor = .{ .r = 27, .g = 28, .b = 29 },
+        .cursor_style = .bar,
+        .cursor_blink = false,
+    });
+    defer restored.deinit(testing.allocator);
+
+    const terminal = &restored.terminal.?;
+    try testing.expectEqual(renderer_palette[1], terminal.colors.palette.original[1]);
+    try testing.expectEqual(RGB{ .r = 101, .g = 102, .b = 103 }, terminal.colors.palette.current[1]);
+    try testing.expectEqual(RGB{ .r = 21, .g = 22, .b = 23 }, terminal.colors.background.default.?);
+    try testing.expectEqual(RGB{ .r = 111, .g = 112, .b = 113 }, terminal.colors.background.override.?);
+    try testing.expectEqual(RGB{ .r = 24, .g = 25, .b = 26 }, terminal.colors.foreground.default.?);
+    try testing.expectEqual(RGB{ .r = 27, .g = 28, .b = 29 }, terminal.colors.cursor.default.?);
+}
+
+test "host-managed snapshot restore joins the first live byte exactly" {
+    const testing = std.testing;
+    const TerminalStream = @import("../terminal/stream_terminal.zig");
+
+    const Case = struct {
+        pending: []const u8,
+        live: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .pending = "\xf0\x9f", .live = "\x98\x80" },
+        .{ .pending = "\x1b[38;2;1;2", .live = ";3mZ" },
+        .{ .pending = "\x1b]777;pending", .live = "\x1b\\Z" },
+    };
+
+    const Fixture = struct {
+        fn inputCallback(_: ?*anyopaque, _: [*]const u8, _: usize) callconv(.c) void {}
+
+        fn resizeCallback(
+            _: ?*anyopaque,
+            _: u16,
+            _: u16,
+            _: u32,
+            _: u32,
+        ) callconv(.c) void {}
+
+        fn encode(
+            alloc: Allocator,
+            terminal: *const terminalpkg.Terminal,
+            stream: anytype,
+        ) ![]u8 {
+            var continuation: std.Io.Writer.Allocating = .init(alloc);
+            defer continuation.deinit();
+            try stream.writeContinuation(&continuation.writer);
+
+            var encoded: std.Io.Writer.Allocating = .init(alloc);
+            errdefer encoded.deinit();
+            try terminalpkg.snapshot.encode(alloc, &encoded.writer, terminal, .{
+                .continuation = if (continuation.written().len == 0)
+                    .ground
+                else
+                    .{ .bytes = continuation.written() },
+            });
+            return encoded.toOwnedSlice();
+        }
+    };
+
+    for (cases) |case| {
+        var config = try configpkg.Config.default(testing.allocator);
+        defer config.deinit();
+        var renderer_wakeup = try xev.Async.init();
+        defer renderer_wakeup.deinit();
+        const renderer_mailbox = try renderer.Thread.Mailbox.create(testing.allocator);
+        defer {
+            while (renderer_mailbox.pop(global.io())) |_| {}
+            renderer_mailbox.destroy(testing.allocator);
+        }
+        var io: Termio = undefined;
+        var renderer_mutex: std.Io.Mutex = .init;
+        var renderer_state: renderer.State = .{
+            .mutex = &renderer_mutex,
+            .terminal = &io.terminal,
+        };
+        io = io: {
+            const size: renderer.Size = .{
+                .screen = .{ .width = 64, .height = 48 },
+                .cell = .{ .width = 8, .height = 16 },
+                .padding = .{},
+            };
+            var derived = try DerivedConfig.init(testing.allocator, &config);
+            errdefer derived.deinit();
+            var terminal = try terminalpkg.Terminal.init(
+                testing.io,
+                testing.allocator,
+                .{
+                    .cols = size.grid().columns,
+                    .rows = size.grid().rows,
+                    .colors = .{
+                        .background = .init(derived.background.toTerminalRGB()),
+                        .foreground = .init(derived.foreground.toTerminalRGB()),
+                        .cursor = cursor: {
+                            const color = derived.cursor_color orelse break :cursor .unset;
+                            const rgb = color.toTerminalRGB() orelse break :cursor .unset;
+                            break :cursor .init(rgb);
+                        },
+                        .palette = .init(derived.palette),
+                    },
+                    .default_cursor_style = derived.cursor_style,
+                    .default_cursor_blink = derived.cursor_blink,
+                },
+            );
+            errdefer terminal.deinit(testing.allocator);
+            var backend: termio.Backend = .{ .host_managed = .init(.{
+                .userdata = null,
+                .input = &Fixture.inputCallback,
+                .resize = &Fixture.resizeCallback,
+            }) };
+            backend.initTerminal(&terminal);
+            var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+            errdefer mailbox.deinit(testing.allocator);
+            break :io .{
+                .alloc = testing.allocator,
+                .backend = backend,
+                .config = derived,
+                .terminal = terminal,
+                .renderer_state = &renderer_state,
+                .renderer_wakeup = renderer_wakeup,
+                .renderer_mailbox = renderer_mailbox,
+                .surface_mailbox = undefined,
+                .size = size,
+                .mailbox = mailbox,
+                .terminal_stream = undefined,
+                .thread_enter_state = null,
+            };
+        };
+        io.terminal_stream = .init(.{
+            .allocator = testing.allocator,
+            .handler = io.streamHandler(&io.terminal, false),
+        });
+        defer io.deinit();
+
+        const palette = io.config.palette;
+        const background = io.config.background.toTerminalRGB();
+        const foreground = io.config.foreground.toTerminalRGB();
+        const cursor = if (io.config.cursor_color) |color| color.toTerminalRGB() else null;
+        var source = try terminalpkg.Terminal.init(testing.io, testing.allocator, .{
+            .cols = 8,
+            .rows = 3,
+            .max_scrollback_lines = 4,
+            .colors = .{
+                .background = .init(background),
+                .foreground = .init(foreground),
+                .cursor = if (cursor) |color| .init(color) else .unset,
+                .palette = .init(palette),
+            },
+            .default_cursor_style = io.config.cursor_style,
+            .default_cursor_blink = io.config.cursor_blink,
+        });
+        defer source.deinit(testing.allocator);
+        var source_stream: TerminalStream.Stream = .init(.{
+            .allocator = testing.allocator,
+            .handler = .init(&source),
+            .continuation_max_bytes = 1024,
+        });
+        defer source_stream.deinit();
+        source_stream.nextSlice("one\r\ntwo\r\nthree\r\nfour\r\n");
+        source_stream.nextSlice("\x1b[?1049h\x1b[1;34mALT\x1b[?25l\x1b[?1049l");
+        source_stream.nextSlice("\x1b[2;31m12345678");
+        try source.setTitle("checkpoint title");
+        try source.setPwd("file://localhost/checkpoint");
+        source.colors.palette.set(1, .{ .r = 10, .g = 20, .b = 30 });
+        source.colors.background.set(.{ .r = 11, .g = 21, .b = 31 });
+        source_stream.nextSlice(case.pending);
+
+        const checkpoint = try Fixture.encode(testing.allocator, &source, &source_stream);
+        defer testing.allocator.free(checkpoint);
+        source_stream.nextSlice(case.live);
+
+        try io.restoreSnapshot(checkpoint);
+        io.processOutput(case.live);
+        const restored_terminal = &io.terminal;
+
+        try testing.expectEqual(source.screens.active_key, restored_terminal.screens.active_key);
+        try testing.expect(std.meta.eql(source.modes, restored_terminal.modes));
+        try testing.expect(std.meta.eql(source.colors, restored_terminal.colors));
+        try testing.expectEqualStrings(source.getTitle().?, restored_terminal.getTitle().?);
+        try testing.expectEqualStrings(source.getPwd().?, restored_terminal.getPwd().?);
+        for ([_]terminalpkg.ScreenSet.Key{ .primary, .alternate }) |key| {
+            const source_screen = source.screens.get(key).?;
+            const restored_screen = restored_terminal.screens.get(key).?;
+            const source_text = try source_screen.dumpStringAlloc(
+                testing.allocator,
+                .{ .viewport = .{} },
+            );
+            defer testing.allocator.free(source_text);
+            const restored_text = try restored_screen.dumpStringAlloc(
+                testing.allocator,
+                .{ .viewport = .{} },
+            );
+            defer testing.allocator.free(restored_text);
+            try testing.expectEqualStrings(source_text, restored_text);
+            try testing.expectEqual(source_screen.pages.scrollbar(), restored_screen.pages.scrollbar());
+            try testing.expectEqual(source_screen.cursor.x, restored_screen.cursor.x);
+            try testing.expectEqual(source_screen.cursor.y, restored_screen.cursor.y);
+            try testing.expectEqual(source_screen.cursor.pending_wrap, restored_screen.cursor.pending_wrap);
+            try testing.expectEqual(source_screen.cursor.style, restored_screen.cursor.style);
+        }
+    }
+}
 
 /// Get information about the process(es) attached to the backend. Returns
 /// `null` if there was an error getting the information or the information is

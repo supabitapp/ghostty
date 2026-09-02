@@ -505,6 +505,13 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+typedef void (*ghostty_surface_host_input_cb)(void*, const uint8_t*, size_t);
+typedef void (*ghostty_surface_host_resize_cb)(void*,
+                                               uint16_t,
+                                               uint16_t,
+                                               uint32_t,
+                                               uint32_t);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -522,6 +529,10 @@ typedef struct {
   ghostty_surface_context_e context;
   const char* const* command_wrapper;
   size_t command_wrapper_count;
+  bool host_managed;
+  void* host_managed_userdata;
+  ghostty_surface_host_input_cb host_managed_input;
+  ghostty_surface_host_resize_cb host_managed_resize;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1176,6 +1187,12 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_write_buffer(ghostty_surface_t,
+                                              const uint8_t*,
+                                              size_t);
+GHOSTTY_API bool ghostty_surface_restore_snapshot(ghostty_surface_t,
+                                                  const uint8_t*,
+                                                  size_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
